@@ -1,13 +1,18 @@
 """The aidot integration."""
 
+import base64
 import ctypes
 import json
 import logging
+import os
 import random
 import socket
 import struct
+import subprocess
+import tempfile
 import time
 import asyncio
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, List, Optional
@@ -939,6 +944,342 @@ class LiveStreamSession:
 
 
 # --------------------------------------------------------------------------- #
+# WebRTC SDES streaming helpers
+# --------------------------------------------------------------------------- #
+
+def _get_local_ip() -> str:
+    """Return the host's LAN IP (used as the RTP receive address in SDP)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _free_udp_port() -> int:
+    """Pick a temporarily free UDP port (closed immediately after probing)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _sdes_key_b64() -> str:
+    """30 random bytes (AES-128 key + salt) encoded as base64."""
+    return base64.b64encode(os.urandom(30)).decode()
+
+
+def _build_sdes_sdp(local_ip: str, audio_port: int, video_port: int,
+                    audio_key: str, video_key: str) -> str:
+    """Build an SDP offer for SDES/SRTP RTP/SAVPF (no DTLS, no ICE negotiation)."""
+    ts = int(time.time())
+    # Short random ICE ufrag/pwd (present in the SDP the camera expects to echo)
+    def _ufrag() -> str:
+        return base64.b64encode(os.urandom(3)).decode()[:4]
+    def _pwd() -> str:
+        return base64.b64encode(os.urandom(16)).decode()[:22]
+
+    return (
+        f"v=0\r\n"
+        f"o=- {ts} {ts} IN IP4 {local_ip}\r\n"
+        f"s=-\r\n"
+        f"t=0 0\r\n"
+        f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
+        f"c=IN IP4 {local_ip}\r\n"
+        f"a=recvonly\r\n"
+        f"a=mid:0\r\n"
+        f"a=ice-ufrag:{_ufrag()}\r\n"
+        f"a=ice-pwd:{_pwd()}\r\n"
+        f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{audio_key}\r\n"
+        f"a=rtpmap:0 PCMU/8000\r\n"
+        f"a=rtpmap:8 PCMA/8000\r\n"
+        f"a=candidate:1 1 udp 2130706431 {local_ip} {audio_port} typ host\r\n"
+        f"m=video {video_port} RTP/SAVPF 96 97\r\n"
+        f"c=IN IP4 {local_ip}\r\n"
+        f"a=recvonly\r\n"
+        f"a=mid:1\r\n"
+        f"a=ice-ufrag:{_ufrag()}\r\n"
+        f"a=ice-pwd:{_pwd()}\r\n"
+        f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{video_key}\r\n"
+        f"a=rtpmap:96 H264/90000\r\n"
+        f"a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n"
+        f"a=rtpmap:97 H265/90000\r\n"
+        f"a=candidate:1 1 udp 2130706431 {local_ip} {video_port} typ host\r\n"
+    )
+
+
+class WebRTCSdesSession:
+    """WebRTC SDES streaming session for cameras with enableSdes=1 / isDTLS=0.
+
+    Flow:
+      1. Allocate UDP ports; generate SDES keys; write SDP file.
+      2. Launch ffmpeg (pre-binds ports, waits for incoming SRTP RTP).
+      3. MQTT signaling over 'IPC' service:
+           getIceConfigReq → livePlayReq echo → webrtcReq offer → webrtcResp answer.
+      4. Camera starts SRTP streaming to our ports; ffmpeg decodes/muxes to output.
+    """
+
+    def __init__(
+        self,
+        mqtt_url: str,
+        user_id: str,
+        mqtt_pwd: str,
+        mqtt_client_id: str,
+        dev_id: str,
+        live_type: int,
+        output_path: str,
+    ) -> None:
+        self._mqtt_url      = mqtt_url
+        self._user_id       = user_id
+        self._mqtt_pwd      = mqtt_pwd
+        self._mqtt_client_id = mqtt_client_id
+        self._dev_id        = dev_id
+        self._live_type     = live_type
+        self._output_path   = output_path
+        self._ffmpeg_proc: Optional[subprocess.Popen] = None
+        self._sdp_path: Optional[str] = None
+        self._running       = False
+
+    async def start(self, timeout: float = 30.0) -> bool:
+        local_ip    = _get_local_ip()
+        audio_port  = _free_udp_port()
+        video_port  = _free_udp_port()
+        audio_key   = _sdes_key_b64()
+        video_key   = _sdes_key_b64()
+        sdp         = _build_sdes_sdp(local_ip, audio_port, video_port,
+                                       audio_key, video_key)
+
+        # Write SDP to a temp file for ffmpeg
+        fd, sdp_path = tempfile.mkstemp(suffix=".sdp", prefix="aidot_sdes_")
+        os.write(fd, sdp.encode())
+        os.close(fd)
+        self._sdp_path = sdp_path
+
+        # Launch ffmpeg up-front so it binds UDP ports before signaling starts
+        ffmpeg_cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-protocol_whitelist", "file,rtp,srtp,udp,crypto",
+            "-f", "sdp", "-i", sdp_path,
+            "-c", "copy", self._output_path,
+        ]
+        _LOGGER.debug("WebRTCSdesSession: launching ffmpeg %s", " ".join(ffmpeg_cmd))
+        try:
+            self._ffmpeg_proc = subprocess.Popen(
+                ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
+        except FileNotFoundError:
+            _LOGGER.error("WebRTCSdesSession: ffmpeg not found — install it with: apt install ffmpeg")
+            return False
+
+        _LOGGER.warning(
+            "WebRTCSdesSession: ffmpeg pid=%d  local=%s  audio=%d  video=%d",
+            self._ffmpeg_proc.pid, local_ip, audio_port, video_port,
+        )
+
+        # Generate peerid: <random-uuid>_<6-hex>_<liveType>_0_1
+        peerid = (f"{uuid.uuid4().hex}_{random.randint(0, 0xFFFFFF):06x}"
+                  f"_{self._live_type}_0_1")
+
+        # MQTT signaling (blocking, run in executor)
+        ok = await asyncio.get_event_loop().run_in_executor(
+            None, self._signaling_sync, peerid, sdp, timeout
+        )
+        if not ok:
+            await self.stop()
+            return False
+
+        self._running = True
+        return True
+
+    def _signaling_sync(self, peerid: str, sdp: str, timeout: float) -> bool:
+        """Blocking MQTT signaling: livePlayReq → webrtcReq → webrtcResp."""
+        try:
+            import paho.mqtt.client as mqtt
+        except ImportError:
+            _LOGGER.error("WebRTCSdesSession: paho-mqtt required — pip install paho-mqtt")
+            return False
+
+        import ssl
+        import threading
+        import urllib.parse
+
+        parsed    = urllib.parse.urlparse(self._mqtt_url)
+        host      = parsed.hostname or self._mqtt_url
+        port      = parsed.port or (443 if parsed.scheme in ("wss", "mqtts") else 1883)
+        path      = parsed.path or "/mqtt"
+        use_tls   = parsed.scheme in ("wss", "mqtts")
+        transport = "websockets" if parsed.scheme in ("wss", "ws") else "tcp"
+
+        sub_topic = f"iot/v1/c/{self._user_id}/#"
+
+        liveplay_evt  = threading.Event()
+        webrtcreq_evt = threading.Event()
+        webrtcack_evt = threading.Event()
+        success_box   = [False]
+
+        def _msg(method: str, extra: Optional[dict] = None) -> str:
+            body: dict = {
+                "service": "IPC",
+                "method":  method,
+                "seq":     str(random.randint(100_000, 999_999)),
+                "srcAddr": f"0.{self._user_id}",
+                "payload": {
+                    "peerid":  peerid,
+                    "devId":   self._dev_id,
+                    "dstAddr": self._user_id,
+                },
+            }
+            if extra:
+                body["payload"].update(extra)
+            return json.dumps(body)
+
+        def _pub(client, method: str, extra: Optional[dict] = None) -> None:
+            topic = f"iot/v1/s/{self._user_id}/IPC/{method}"
+            client.publish(topic, _msg(method, extra), qos=1)
+            _LOGGER.debug("WebRTCSdesSession MQTT tx: %s", method)
+
+        def on_connect(client, userdata, flags, rc):
+            if rc != 0:
+                _LOGGER.warning("WebRTCSdesSession: broker rejected rc=%d", rc)
+                liveplay_evt.set()
+                return
+            client.subscribe(sub_topic, qos=1)
+            # Optional STUN/TURN discovery
+            ice_body = json.dumps({
+                "service": "IPC", "method": "getIceConfigReq",
+                "seq": str(random.randint(100_000, 999_999)),
+                "srcAddr": f"0.{self._user_id}",
+                "payload": {"devId": self._dev_id, "dstAddr": self._user_id},
+            })
+            client.publish(
+                f"iot/v1/s/{self._user_id}/IPC/getIceConfigReq", ice_body, qos=1
+            )
+            _pub(client, "livePlayReq")
+
+        def on_message(client, userdata, msg):
+            try:
+                body   = json.loads(msg.payload.decode("utf-8"))
+                method = body.get("method") or ""
+                pld    = body.get("payload") or {}
+                if pld.get("peerid") != peerid:
+                    return
+                _LOGGER.warning(
+                    "WebRTCSdesSession MQTT rx: method=%r  topic=%s",
+                    method, msg.topic,
+                )
+                if method == "livePlayReq":
+                    liveplay_evt.set()
+                elif method == "webrtcReq":
+                    webrtcreq_evt.set()
+                elif method == "webrtcResp":
+                    webrtcack_evt.set()
+            except Exception:
+                pass
+
+        mqttc = mqtt.Client(client_id=self._mqtt_client_id, transport=transport)
+        if use_tls:
+            mqttc.tls_set(cert_reqs=ssl.CERT_REQUIRED)
+        if transport == "websockets":
+            mqttc.ws_set_options(path=path)
+        mqttc.username_pw_set(self._user_id, self._mqtt_pwd)
+        mqttc.on_connect = on_connect
+        mqttc.on_message = on_message
+
+        try:
+            mqttc.connect(host, port, keepalive=30)
+            mqttc.loop_start()
+
+            # --- Step 1: livePlayReq echo ---
+            if not liveplay_evt.wait(timeout=12.0):
+                _LOGGER.error("WebRTCSdesSession: livePlayReq echo timed out")
+                return False
+
+            # --- Step 2: webrtcReq (send our SDP offer) ---
+            mqttc.publish(
+                f"iot/v1/s/{self._user_id}/IPC/webrtcReq",
+                _msg("webrtcReq", {"offer": {"type": "offer", "sdp": sdp}, "trackId": 0}),
+                qos=1,
+            )
+            _LOGGER.debug("WebRTCSdesSession MQTT tx: webrtcReq")
+
+            if not webrtcreq_evt.wait(timeout=12.0):
+                _LOGGER.error("WebRTCSdesSession: webrtcReq response timed out")
+                return False
+
+            # --- Step 3: webrtcResp (our answer = same SDP, type=answer) ---
+            # The camera echoes our offer back; our answer tells it to start streaming.
+            mqttc.publish(
+                f"iot/v1/s/{self._user_id}/IPC/webrtcResp",
+                _msg("webrtcResp", {
+                    "answer": {"type": "answer", "sdp": sdp},
+                    "trackId": 0,
+                }),
+                qos=1,
+            )
+            _LOGGER.debug("WebRTCSdesSession MQTT tx: webrtcResp")
+
+            if webrtcack_evt.wait(timeout=8.0):
+                _LOGGER.warning("WebRTCSdesSession: camera acked webrtcResp — stream starting")
+            else:
+                _LOGGER.warning(
+                    "WebRTCSdesSession: no webrtcResp ack within 8s "
+                    "(camera may still start streaming)"
+                )
+
+            success_box[0] = True
+            return True
+
+        except Exception as exc:
+            _LOGGER.error("WebRTCSdesSession: MQTT signaling error: %s", exc)
+            return False
+        finally:
+            mqttc.loop_stop()
+            try:
+                mqttc.disconnect()
+            except Exception:
+                pass
+
+    async def wait_for_output(self, seconds: float = 30.0) -> int:
+        """Wait up to *seconds* for ffmpeg to produce output; return file size."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and self._running:
+            await asyncio.sleep(1.0)
+            try:
+                sz = os.path.getsize(self._output_path)
+                if sz > 0:
+                    _LOGGER.warning(
+                        "WebRTCSdesSession: output growing  path=%s  size=%d",
+                        self._output_path, sz,
+                    )
+            except OSError:
+                sz = 0
+        try:
+            return os.path.getsize(self._output_path)
+        except OSError:
+            return 0
+
+    async def stop(self) -> None:
+        self._running = False
+        if self._ffmpeg_proc is not None:
+            self._ffmpeg_proc.terminate()
+            try:
+                self._ffmpeg_proc.wait(timeout=3)
+            except Exception:
+                self._ffmpeg_proc.kill()
+            self._ffmpeg_proc = None
+        if self._sdp_path and os.path.exists(self._sdp_path):
+            try:
+                os.unlink(self._sdp_path)
+            except OSError:
+                pass
+            self._sdp_path = None
+
+
+# --------------------------------------------------------------------------- #
 # DeviceClient
 # --------------------------------------------------------------------------- #
 
@@ -987,6 +1328,8 @@ class DeviceClient(object):
         self.password = device.get(CONF_PASSWORD)
         self.device_id = device.get(CONF_ID)
         self._simpleVersion = device.get("simpleVersion")
+        # Device capability properties (e.g. enableSdes, isDTLS, liveType)
+        self._device_props: dict = device.get("properties") or {}
 
     # -- Camera helpers ------------------------------------------------------ #
 
@@ -1346,6 +1689,64 @@ class DeviceClient(object):
         _LOGGER.info(
             "Live stream session open for %s -> %s:%d",
             self.device_id, server_ip, server_port,
+        )
+        return session
+
+    async def async_open_webrtc_stream(
+        self,
+        output_path: str,
+        timeout: float = 30.0,
+    ) -> Optional["WebRTCSdesSession"]:
+        """Open a WebRTC SDES live stream and mux it to *output_path* via ffmpeg.
+
+        The camera must have enableSdes=1 in its device properties.  Returns a
+        running WebRTCSdesSession, or None if the handshake or ffmpeg launch fails.
+        Call session.stop() when done.
+
+        Protocol (SDES, no DTLS):
+          MQTT IPC/getIceConfigReq → IPC/livePlayReq → IPC/webrtcReq → IPC/webrtcResp
+          Camera then streams SRTP RTP to the local UDP ports declared in the SDP.
+        """
+        mqtt_pwd = (
+            self._user_info.get("mqqtPwd")
+            or self._user_info.get("mqttPwd")
+            or self._user_info.get("mqtt_pwd")
+            or self._user_info.get("mqttPassword")
+            or ""
+        )
+        mqtt_client_id = (
+            self._user_info.get("mqttClientId")
+            or f"app-{self.user_id}"
+        )
+        live_type = int(self._device_props.get("liveType") or 2)
+
+        mqtt_url = await self._async_get_mqtt_url()
+        if not mqtt_url:
+            _LOGGER.error(
+                "async_open_webrtc_stream: cannot determine MQTT URL for %s",
+                self.device_id,
+            )
+            return None
+
+        session = WebRTCSdesSession(
+            mqtt_url       = mqtt_url,
+            user_id        = str(self.user_id),
+            mqtt_pwd       = mqtt_pwd,
+            mqtt_client_id = mqtt_client_id,
+            dev_id         = self.device_id,
+            live_type      = live_type,
+            output_path    = output_path,
+        )
+        if not await session.start(timeout=timeout):
+            _LOGGER.error(
+                "async_open_webrtc_stream: session start failed for %s",
+                self.device_id,
+            )
+            return None
+
+        _LOGGER.warning(
+            "async_open_webrtc_stream: SDES session open for %s -> %s",
+            self.device_id, output_path,
         )
         return session
 
