@@ -446,20 +446,25 @@ async def _mqtt_get_live_server_info(
     import urllib.parse
 
     seq       = str(random.randint(100_000, 999_999))
-    pub_topic = f"iot/v1/s/{user_id}/IPCAM/connectipc"
     sub_topic = f"iot/v1/c/{user_id}/#"
 
-    request_body = json.dumps({
-        "service": "IPCAM",
-        "method":  "connectipc",
-        "seq":     seq,
-        "srcAddr": f"0.{user_id}",
-        "payload": {
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "deviceId":  dev_id,
-            "clientId":  client_id,
-        },
-    })
+    def _make_request(method: str) -> str:
+        return json.dumps({
+            "service": "IPCAM",
+            "method":  method,
+            "seq":     seq,
+            "srcAddr": f"0.{user_id}",
+            "payload": {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "deviceId":  dev_id,
+                "clientId":  client_id,
+            },
+        })
+
+    # Try livePlayReq first (device-side real-play); fall back to webrtcReq
+    # and legacy connectipc.  Send all three so we receive whichever the
+    # camera honours.  The first matching response wins.
+    _methods_to_try = ["livePlayReq", "webrtcReq", "connectipc"]
 
     result_event = threading.Event()
     result_box: List[Optional[dict]] = [None]
@@ -473,18 +478,29 @@ async def _mqtt_get_live_server_info(
 
     def on_connect(client, userdata, flags, rc):
         if rc != 0:
-            _LOGGER.warning("MQTT (connectipc) broker rejected connection rc=%d", rc)
+            _LOGGER.warning(
+                "MQTT (live stream probe) broker rejected connection rc=%d", rc
+            )
             result_event.set()
             return
         client.subscribe(sub_topic, qos=1)
-        client.publish(pub_topic, request_body, qos=1)
+        for method in _methods_to_try:
+            pub_topic = f"iot/v1/s/{user_id}/IPCAM/{method}"
+            client.publish(pub_topic, _make_request(method), qos=1)
+            _LOGGER.debug("Live stream MQTT: published %s to %s", method, pub_topic)
 
     def on_message(client, userdata, msg):
         try:
             body = json.loads(msg.payload.decode("utf-8"))
             if str(body.get("seq")) == seq:
                 pld = body.get("payload")
-                if pld and pld.get("serverIP"):
+                # Accept any non-empty payload – log it so we can see the actual
+                # field names the camera returns regardless of protocol variant.
+                _LOGGER.warning(
+                    "Live stream MQTT: received response method=%r payload=%s",
+                    body.get("method"), json.dumps(pld),
+                )
+                if pld:
                     result_box[0] = pld
                     result_event.set()
         except Exception:
@@ -1236,9 +1252,10 @@ class DeviceClient(object):
         # on_frame: called in the asyncio event loop for each decoded frame.
         # Returns a running LiveStreamSession, or None if the handshake fails.
         #
-        # Two-step handshake from iOS LDSXplayer -startRealPlay:
-        #   1. MQTT connectipc  -> serverIP, serverPort, sessionId, aesKey, heartbeat, tls
-        #   2. TLS TCP LOGIN + STREAM_REQ (AES-256/ECB/PKCS7 on all payloads)
+        # Two-step handshake:
+        #   1. MQTT livePlayReq (or webrtcReq / connectipc fallback)
+        #      -> serverIP, serverPort, [sessionId, aesKey,] heartbeat, tls
+        #   2. TLS TCP LOGIN + STREAM_REQ (AES-256/ECB/PKCS7 when aesKey present)
 
         mqtt_pwd = (
             self._user_info.get("mqqtPwd")
@@ -1248,7 +1265,7 @@ class DeviceClient(object):
         )
         client_id = f"app-{self.user_id}"
 
-        # Step 1 -- MQTT connectipc
+        # Step 1 -- MQTT live stream server probe (livePlayReq / webrtcReq / connectipc)
         mqtt_url = await self._async_get_mqtt_url()
         if not mqtt_url:
             _LOGGER.error(
@@ -1257,37 +1274,55 @@ class DeviceClient(object):
             )
             return None
 
-        _LOGGER.debug("Live stream step 1: MQTT connectipc for %s", self.device_id)
+        _LOGGER.debug(
+            "Live stream step 1: MQTT livePlayReq/webrtcReq for %s", self.device_id
+        )
         srv_info = await _mqtt_get_live_server_info(
             mqtt_url, str(self.user_id), mqtt_pwd,
             self.device_id, client_id, timeout=timeout,
         )
         if not srv_info:
             _LOGGER.error(
-                "async_open_live_stream: MQTT connectipc response empty for %s. "
-                "Camera may be offline or may not support this streaming path.",
+                "async_open_live_stream: no MQTT response for %s. "
+                "Camera may be offline or the MQTT method is not supported. "
+                "Tried: livePlayReq, webrtcReq, connectipc.",
                 self.device_id,
             )
             return None
 
-        server_ip   = srv_info.get("serverIP")
-        server_port = srv_info.get("serverPort")
-        session_id  = srv_info.get("sessionId") or ""
-        aes_key     = srv_info.get("aesKey") or ""
+        # Log the full response at WARNING so it always appears in test output,
+        # letting us see the real field names the camera uses.
+        _LOGGER.warning(
+            "async_open_live_stream: MQTT response for %s: %s",
+            self.device_id, json.dumps(srv_info),
+        )
+
+        # Normalise common field-name variants from different firmware versions.
+        server_ip   = (srv_info.get("serverIP")
+                       or srv_info.get("server_ip")
+                       or srv_info.get("ip"))
+        server_port = (srv_info.get("serverPort")
+                       or srv_info.get("server_port")
+                       or srv_info.get("port"))
+        session_id  = srv_info.get("sessionId") or srv_info.get("session_id") or ""
+        aes_key     = srv_info.get("aesKey") or srv_info.get("aes_key") or ""
         heartbeat   = int(srv_info.get("heartbeat") or 15)
         use_tls     = bool(srv_info.get("tls", True))
 
         if not server_ip or not server_port:
             _LOGGER.error(
-                "async_open_live_stream: incomplete server info for %s: %s",
-                self.device_id, srv_info,
+                "async_open_live_stream: response for %s has no server address. "
+                "Full payload logged above. "
+                "Camera may use WebRTC (ICE/DTLS) or a different protocol variant "
+                "not yet implemented in this client.",
+                self.device_id,
             )
             return None
 
         if not aes_key:
             _LOGGER.warning(
                 "async_open_live_stream: no aesKey in response for %s -- "
-                "AES encryption disabled",
+                "sending TCP payloads unencrypted",
                 self.device_id,
             )
 
