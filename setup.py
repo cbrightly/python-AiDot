@@ -16,6 +16,12 @@ setuptools.setup(
         "requests",
         "aiohttp",
     ],
+    extras_require={
+        "camera": [
+            "paho-mqtt",
+            "av",
+        ],
+    },
     classifiers=(
         "Programming Language :: Python :: 3.12",
         "License :: OSI Approved :: MIT License",
