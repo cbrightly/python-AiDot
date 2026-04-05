@@ -1544,6 +1544,8 @@ class DeviceClient(object):
             or device.get("ip") or device.get("localIPAddress")
             or device.get("wlanIp") or device.get("wifiIp")
             or device.get("lanIp") or device.get("addr")
+            or (device.get("properties") or {}).get("ipAddress")
+            or (device.get("properties") or {}).get("ip")
         )
         if _dev_ip_init:
             self._ip_address = _dev_ip_init
@@ -2591,11 +2593,14 @@ class DeviceClient(object):
             or (_cam_user_info or {}).get("ip")
             or (_cam_user_info or {}).get("localIPAddress")
             or self._ip_address
+            or ((self._raw_device or {}).get("properties") or {}).get("ipAddress")
+            or ((self._raw_device or {}).get("properties") or {}).get("ip")
         ) or None
         if not _cam_local_ip:
             _LOGGER.warning(
                 "async_open_webrtc_stream: camera IP unknown for %s"
-                " — no IP field in batchGetDeviceUserInfo and no LAN-discovered IP."
+                " — no IP field in batchGetDeviceUserInfo, device properties,"
+                " or LAN-discovered IP."
                 " Synthetic ICE candidates cannot be injected; ICE will fail for"
                 " ICE-lite cameras (e.g. LK.IPC.A001064).  user_info_keys=%s"
                 "  raw_device_keys=%s",
