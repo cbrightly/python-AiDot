@@ -2462,6 +2462,7 @@ class DeviceClient(object):
         status_callback: Optional[Callable[[str], None]] = None,
         force_sdes: Optional[bool] = None,
         _skip_ice_config: bool = False,
+        _ice_config: "Optional[dict]" = None,
     ) -> "WebRTCSession":
         """Open a liveType=2 WebRTC stream via MQTT signaling.
 
@@ -2849,6 +2850,11 @@ class DeviceClient(object):
                     )
                 if _ice_inner and not ice_config_fut.done():
                     loop.call_soon_threadsafe(ice_config_fut.set_result, _ice_inner)
+                    # getIceConfigResp arriving means the broker session is
+                    # active and TURN credentials are available.  Wake the
+                    # camera_ready_ev so we don't burn the full 12-second
+                    # timeout when the server responds promptly.
+                    loop.call_soon_threadsafe(camera_ready_ev.set)
                 elif not _ice_inner and not ice_config_fut.done():
                     # No usable payload — store the whole message as fallback.
                     _LOGGER.warning(
@@ -2927,20 +2933,33 @@ class DeviceClient(object):
         # camera is already awake from the SDES attempt so the wake phase is
         # unnecessary; skipping saves up to 17 s of timeout overhead.
         # ------------------------------------------------------------------ #
+        # Build getIceConfigReq payload unconditionally — used in both the
+        # normal wake-wait path and the DTLS-fallback no-wait path below.
+        _ice_req_payload = json.dumps({
+            "method":  "getIceConfigReq",
+            "service": "IPC",
+            "devId":   device_id,
+            "srcAddr": f"{terminal_idx}.{user_id}",
+            "seq":     f"ap{random.randint(1000000, 9999999)}",
+            "tst":     int(time.time() * 1000),
+            **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
+            "payload": {"devId": device_id, "userId": user_id},
+        })
+
         if _skip_ice_config:
             camera_ready_ev.set()  # camera already awake; skip wake handshake
-            _status("Skipping getIceConfigReq (DTLS fallback — camera already awake)")
+            _status("Skipping getIceConfigReq wake wait (DTLS fallback — camera already awake)")
+            # Still send getIceConfigReq so TURN credentials can be gathered
+            # asynchronously.  The server may respond now that the camera already
+            # has an active MQTT session from the preceding SDES attempt.
+            outgoing_q.put_nowait(
+                (f"iot/v1/s/{user_id}/IPC/getIceConfigReq", _ice_req_payload)
+            )
+            # If the caller pre-loaded ICE config from a prior attempt, seed the
+            # future immediately so RTCPeerConnection picks up TURN servers.
+            if _ice_config is not None and not ice_config_fut.done():
+                loop.call_soon_threadsafe(ice_config_fut.set_result, _ice_config)
         else:
-            _ice_req_payload = json.dumps({
-                "method":  "getIceConfigReq",
-                "service": "IPC",
-                "devId":   device_id,
-                "srcAddr": f"{terminal_idx}.{user_id}",
-                "seq":     f"ap{random.randint(1000000, 9999999)}",
-                "tst":     int(time.time() * 1000),
-                **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
-                "payload": {"devId": device_id, "userId": user_id},
-            })
             outgoing_q.put_nowait(
                 (f"iot/v1/s/{user_id}/IPC/getIceConfigReq", _ice_req_payload)
             )
@@ -2992,6 +3011,17 @@ class DeviceClient(object):
             outgoing_q.put_nowait((live_play_topic, _live_req_payload))
             _status(f"livePlayReq sent  peerid={peer_id}")
             await asyncio.sleep(0.5)
+            # Short extra wait for getIceConfigResp — the server may only respond
+            # once a live camera session is active (i.e. after livePlayReq).
+            # Waiting here ensures TURN credentials arrive before RTCPeerConnection
+            # is created.  The 3-second window is long enough for typical Arnoo
+            # broker round-trips without adding noticeable latency to fast paths.
+            if not ice_config_fut.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(ice_config_fut), timeout=3.0)
+                    _status("getIceConfigResp received (post-livePlayReq)")
+                except asyncio.TimeoutError:
+                    pass  # proceed without TURN; synthetic candidates are fallback
 
         # ------------------------------------------------------------------ #
         # Branch: SDES-SRTP cameras use ffmpeg; DTLS cameras use aiortc
@@ -3040,6 +3070,9 @@ class DeviceClient(object):
                     status_callback=status_callback,
                     force_sdes=False,
                     _skip_ice_config=True,
+                    _ice_config=(
+                        ice_config_fut.result() if ice_config_fut.done() else None
+                    ),
                 )
 
         # ------------------------------------------------------------------ #
@@ -3389,9 +3422,43 @@ class DeviceClient(object):
                 result.extend(kept)
             return '\r\n'.join(result)
 
-        _offer_sdp = _reorder_m_section_ice_attrs(
-            _normalize_bundle_ice_credentials(
-                _inject_h265_into_mid1(_upgrade_sctp(pc.localDescription.sdp))
+        def _filter_sdp_candidates(sdp: str) -> str:
+            """Remove ICE candidates that are unreachable from remote cameras.
+
+            Strips Docker-bridge (172.17.x), CGNAT/Tailscale (100.x.x.x), and
+            all IPv6 addresses from the SDP.  These addresses are only reachable
+            within the local host or VPN and waste ICE checking time; they also
+            cause ICE-lite cameras to echo them back verbatim as their own
+            candidates, polluting the remote candidate list.
+
+            LAN (192.168.x / 10.x / 172.16-31 non-Docker), srflx, and TURN
+            relay candidates are kept — they represent paths a remote camera
+            can actually use.
+            """
+            import re as _re
+            out = []
+            for line in _re.split(r'\r?\n', sdp):
+                if line.startswith('a=candidate:'):
+                    # Skip Docker bridge 172.17.x
+                    if _re.search(r'\b172\.17\.', line):
+                        continue
+                    # Skip CGNAT / Tailscale 100.x.x.x
+                    if _re.search(r'\b100\.\d+\.\d+\.\d+\b', line):
+                        continue
+                    # Skip IPv6 candidates (any colon-containing IP field)
+                    # Format: "a=candidate:... IP6-addr port ..."
+                    parts = line.split()
+                    # parts[4] is the IP address in standard candidate line
+                    if len(parts) > 4 and ':' in parts[4]:
+                        continue
+                out.append(line)
+            return '\r\n'.join(out)
+
+        _offer_sdp = _filter_sdp_candidates(
+            _reorder_m_section_ice_attrs(
+                _normalize_bundle_ice_credentials(
+                    _inject_h265_into_mid1(_upgrade_sctp(pc.localDescription.sdp))
+                )
             )
         )
         _patched_mlines = [ln for ln in _offer_sdp.splitlines() if ln.startswith("m=")]
@@ -3443,6 +3510,20 @@ class DeviceClient(object):
         def _on_local_ice(candidate) -> None:
             if candidate is None:
                 return
+            # Skip candidates that remote cameras cannot use.
+            # Docker-bridge (172.17.x), CGNAT/Tailscale (100.x.x.x), and
+            # IPv6 addresses are unreachable from cameras on the internet or
+            # a different LAN segment.  Sending them wastes ICE checking time
+            # and can cause ICE-lite cameras to echo them back as their own
+            # candidates, polluting the remote candidate list.
+            import re as _re
+            _cand_ip = getattr(candidate, "ip", "") or ""
+            if _re.match(r'^172\.17\.', _cand_ip):
+                return  # Docker bridge — skip
+            if _re.match(r'^100\.', _cand_ip):
+                return  # CGNAT / Tailscale — skip
+            if ':' in _cand_ip:
+                return  # IPv6 — skip
             cand_str = (
                 f"candidate:{candidate.foundation} {candidate.component} "
                 f"{candidate.protocol} {candidate.priority} {candidate.ip} "
@@ -3671,16 +3752,17 @@ class DeviceClient(object):
 
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
             # The camera's real second answer (second webrtcResp) declares a=setup:passive —
-            # the camera acts as DTLS server.  By setting the synthetic remote SDP to
-            # passive (above), aiortc becomes DTLS active (client) and sends the DTLS
-            # ClientHello after ICE connects.  RFC 5763: remote=passive → local=active.
-            # We therefore also declare setup:passive in our webrtcResp so the camera
-            # knows we intend to be the DTLS server from the SDP perspective; in practice
-            # aiortc drives the handshake as client regardless.
+            # the camera acts as DTLS server (passive).  We must be the DTLS client (active)
+            # so we initiate the ClientHello after ICE connects.
+            # RFC 5763: if remote=passive → local=active (client).
+            # The synthetic remote SDP above already sets a=setup:passive so aiortc
+            # becomes DTLS active/client internally.  We also declare setup:active in our
+            # webrtcResp so the camera's SDP parser sees a consistent role assignment and
+            # doesn't wait for a ClientHello from us when we are the one initiating it.
             # aiortc generates SDPs with \r\n so a simple replace is safe here.
             _rr_answer_sdp = _normalize_bundle_ice_credentials(
                 pc.localDescription.sdp.replace(
-                    "a=setup:actpass\r\n", "a=setup:passive\r\n"
+                    "a=setup:actpass\r\n", "a=setup:active\r\n"
                 )
             )
             _webrtc_resp_topic   = f"iot/v1/s/{user_id}/IPC/webrtcResp"
@@ -3701,7 +3783,7 @@ class DeviceClient(object):
                 },
             })
             outgoing_q.put_nowait((_webrtc_resp_topic, _webrtc_resp_payload))
-            _status("webrtcResp sent (role-reversal answer, setup=passive)")
+            _status("webrtcResp sent (role-reversal answer, setup=active)")
 
             # Re-announce ALL our gathered ICE candidates (host + srflx/prflx) after
             # sending webrtcResp.  The @pc.on("icecandidate") callbacks fired during
@@ -3830,6 +3912,7 @@ class DeviceClient(object):
 
         deadline = time.monotonic() + timeout
         _last_ice_log = time.monotonic()
+        _devattr_midloop_sent = False  # guard: send getDevAttrReq once at half-timeout
         while not connected_ev.is_set() and time.monotonic() < deadline:
             # Drain incoming ICE candidates from the camera
             while True:
@@ -3888,6 +3971,30 @@ class DeviceClient(object):
                     f"  remaining={deadline - time.monotonic():.0f}s"
                 )
                 _last_ice_log = time.monotonic()
+            # Mid-loop getDevAttrReq retry: if no camera IP yet and ~half of the
+            # ICE timeout has elapsed, send getDevAttrReq again.  The camera may
+            # have been slow to wake up or the first requests may have been lost.
+            _remaining = deadline - time.monotonic()
+            if (not _devattr_midloop_sent
+                    and cam_ip_q.empty()
+                    and _remaining > 0
+                    and _remaining <= timeout / 2.0):
+                outgoing_q.put_nowait((
+                    f"iot/v1/s/{user_id}/IPC/getDevAttrReq",
+                    json.dumps({
+                        "method":  "getDevAttrReq",
+                        "service": "IPC",
+                        "devId":   device_id,
+                        "srcAddr": f"{terminal_idx}.{user_id}",
+                        "seq":     _seq(),
+                        "tst":     int(time.time() * 1000),
+                        **( {"userId": _numeric_uid_raw}
+                            if _numeric_uid_raw is not None else {} ),
+                        "payload": {"devId": device_id},
+                    })
+                ))
+                _devattr_midloop_sent = True
+                _status("getDevAttrReq re-sent (mid-loop, waiting for camera IP)")
             await asyncio.sleep(0.1)
 
         if pc.connectionState not in ("connected", "completed"):
