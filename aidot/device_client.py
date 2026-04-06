@@ -3559,22 +3559,27 @@ class DeviceClient(object):
             "tst":     int(time.time() * 1000),
             **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
             "payload": {
-                # Legacy flat fields — older firmware parses payload.peerid directly.
-                "peerid":  peer_id,
-                "devId":   device_id,
-                "offer":   {"type": pc.localDescription.type,
-                             "sdp":  _offer_sdp},
-                "trackId": 0,
-                "dstAddr": user_id,
                 # Browser-style nested fields — newer firmware (e.g. A001064)
                 # parses payload.wPayload.peerid / payload.wPayload.offer and
                 # requires IceServerList to activate its ICE agent.
+                # HAR captures from the official AiDot web app confirm this is
+                # the canonical format; flat fields are kept for older firmware.
                 "wPayload": {
                     "peerid": peer_id,
                     "offer":  {"type": pc.localDescription.type,
                                 "sdp":  _offer_sdp},
                 },
                 "IceServerList": _ice_server_list,
+                # Legacy flat fields — older firmware parses payload.peerid directly.
+                "peerid":  peer_id,
+                "devId":   device_id,
+                "offer":   {"type": pc.localDescription.type,
+                             "sdp":  _offer_sdp},
+                "trackId": 0,
+                # dstAddr routes the offer to the target device (device ID, not user
+                # ID).  Web app omits this entirely; using device_id is safer than
+                # user_id which the camera firmware would not recognise as a device.
+                "dstAddr": device_id,
             },
         })
         outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
@@ -3650,10 +3655,22 @@ class DeviceClient(object):
                 "tst":     int(time.time() * 1000),
                 **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
                 "payload": {
+                    # dstAddr routes the candidate to the target device (device ID,
+                    # not user ID).  HAR captures from the official AiDot web app
+                    # confirm payload.dstAddr = deviceId on every iceCandidateReq.
+                    "dstAddr": device_id,
+                    # wPayload is the browser-style nested format required by
+                    # newer firmware (e.g. LK.IPC.A001064) that parses
+                    # payload.wPayload.candidate rather than payload.candidate.
+                    "wPayload": {
+                        "peerid":    peer_id,
+                        "candidate": _cand_obj,
+                    },
+                    # Keep flat fields for older firmware that reads payload.peerid /
+                    # payload.candidate directly.
                     "peerid":    peer_id,
                     "devId":     device_id,
                     "candidate": _cand_obj,
-                    "dstAddr":   user_id,
                 },
             })
             outgoing_q.put_nowait((ice_cand_topic, payload))
