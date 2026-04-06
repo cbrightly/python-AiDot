@@ -3995,6 +3995,13 @@ class DeviceClient(object):
                 cand_line = _re.sub(r'\s+generation\s+\d+.*$', '', cand_line).strip()
                 try:
                     ice_cand = candidate_from_sdp(cand_line)
+                    _smid_val = cand_dict.get("sdpMid")
+                    _smidx_val = cand_dict.get("sdpMLineIndex")
+                    ice_cand.sdpMid = (
+                        str(_smid_val) if _smid_val is not None else
+                        (str(_smidx_val) if _smidx_val is not None else "0")
+                    )
+                    ice_cand.sdpMLineIndex = _smidx_val
                     await pc.addIceCandidate(ice_cand)
                     _status(f"addIceCandidate: {cand_line[:80]}")
                 except Exception as exc:
@@ -4020,6 +4027,8 @@ class DeviceClient(object):
                         )
                         try:
                             _synth_ice = candidate_from_sdp(_synth_cand_line)
+                            _synth_ice.sdpMid = _c_smid
+                            _synth_ice.sdpMLineIndex = _c_smidx
                             await pc.addIceCandidate(_synth_ice)
                             _status(
                                 f"addIceCandidate (cam-IP synth):"
