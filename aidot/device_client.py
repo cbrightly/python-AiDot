@@ -2455,42 +2455,42 @@ class DeviceClient(object):
     async def async_get_ice_config_http(self) -> Optional[dict]:
         """Fetch ICE config via HTTP (primary path used by official app).
 
-        Calls ``/v29/api/webrtc/iceConfig?forceRefresh=0`` with a Bearer token.
+        Calls ``/v29/api/webrtc/iceConfig?forceRefresh=0`` using the same
+        Appid/Token headers used by all other AiDot platform API calls.
         Returns a dict with ``app`` / ``dev`` keys on success, or ``None``.
         """
         import aiohttp
 
-        region = self._region
         token = (
             self._user_info.get("accessToken")
-            or self._user_info.get("accesstoken")
+            or self._user_info.get("access_token")
         )
 
-        if not region or not token:
+        if not self._region or not token:
             _LOGGER.warning(
                 "async_get_ice_config_http: missing region or access token"
             )
             return None
 
         url = (
-            f"https://prod-{region}-api.arnoo.com"
+            f"https://prod-{self._region}-api.arnoo.com"
             f"/v29/api/webrtc/iceConfig?forceRefresh=0"
         )
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers) as resp:
+                async with session.get(
+                    url,
+                    headers=self._aidot_headers(),
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
                     if resp.status != 200:
                         _LOGGER.warning(
                             "async_get_ice_config_http: HTTP %s from %s",
                             resp.status, url,
                         )
                         return None
-                    return await resp.json()
+                    return await resp.json(content_type=None)
         except Exception as exc:
             _LOGGER.warning("async_get_ice_config_http failed: %s", exc)
             return None
@@ -2724,22 +2724,6 @@ class DeviceClient(object):
         live_play_topic  = f"iot/v1/s/{user_id}/IPC/livePlayReq"
 
         # ------------------------------------------------------------------ #
-        # HTTP-first ICE config pre-fetch (matches official app behaviour)
-        # ------------------------------------------------------------------ #
-        # Try the HTTP endpoint before starting MQTT so TURN credentials are
-        # available immediately when RTCPeerConnection is created, without
-        # waiting for the 3–12 s MQTT wake cycle.  Skipped on DTLS-fallback
-        # retries (_skip_ice_config=True) and when the caller already supplied
-        # _ice_config from a prior attempt.
-        _http_ice_config: Optional[dict] = None
-        if not _skip_ice_config and _ice_config is None:
-            _http_ice_config = await self.async_get_ice_config_http()
-            if _http_ice_config:
-                _status("ICE config fetched via HTTP (primary path)")
-            else:
-                _status("HTTP ICE config unavailable — will use MQTT path")
-
-        # ------------------------------------------------------------------ #
         # MQTT ↔ asyncio bridge
         # ------------------------------------------------------------------ #
         outgoing_q:       _q_mod.Queue    = _q_mod.Queue()
@@ -2765,6 +2749,22 @@ class DeviceClient(object):
 
         if _numeric_uid_raw is not None and numeric_user_id != user_id:
             _status(f"Numeric userId for payload injection: {_numeric_uid_raw}")
+
+        # ------------------------------------------------------------------ #
+        # HTTP-first ICE config pre-fetch (matches official app behaviour)
+        # ------------------------------------------------------------------ #
+        # Try the HTTP endpoint before starting MQTT so TURN credentials are
+        # available immediately when RTCPeerConnection is created, without
+        # waiting for the 3–12 s MQTT wake cycle.  Skipped on DTLS-fallback
+        # retries (_skip_ice_config=True) and when the caller already supplied
+        # _ice_config from a prior attempt.
+        _http_ice_config: Optional[dict] = None
+        if not _skip_ice_config and _ice_config is None:
+            _http_ice_config = await self.async_get_ice_config_http()
+            if _http_ice_config:
+                _status("ICE config fetched via HTTP (primary path)")
+            else:
+                _status("HTTP ICE config unavailable — will use MQTT path")
 
         def _on_mqtt_ready(st: dict) -> None:
             _mqtt_conn_status.update(st)
