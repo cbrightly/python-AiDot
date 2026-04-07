@@ -1194,7 +1194,7 @@ def _mqtt_session_sync(
         try:
             rc = int(reason_code)
         except (TypeError, ValueError):
-            rc = -1
+            rc = getattr(reason_code, "value", -1)
         status["connected"] = (rc == 0)
         status["rc"]        = rc
         status["rc_str"]    = str(reason_code)
