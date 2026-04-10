@@ -2629,9 +2629,19 @@ class DeviceClient(object):
         # 1. Additional MQTT subscriptions (cameras may route webrtcResp by numeric ID)
         # 2. Injecting "userId" into the IPC message envelope so camera firmware can
         #    validate the caller (LK.IPC.A001064 silently ignores offers without it).
-        _cam_user_info = await self.async_get_device_user_info(
-            all_device_ids=self._all_device_ids or None
-        )
+        # Run batchGetDeviceUserInfo and HTTP ICE config fetch concurrently —
+        # both are independent HTTP calls; sequencing them wastes up to ~10 s.
+        _fetch_http_ice = not _skip_ice_config and _ice_config is None
+        if _fetch_http_ice:
+            _cam_user_info, _http_ice_config = await asyncio.gather(
+                self.async_get_device_user_info(all_device_ids=self._all_device_ids or None),
+                self.async_get_ice_config_http(),
+            )
+        else:
+            _cam_user_info = await self.async_get_device_user_info(
+                all_device_ids=self._all_device_ids or None
+            )
+            _http_ice_config = None
         _numeric_uid_raw = (_cam_user_info or {}).get("userId")
         if _numeric_uid_raw is not None:
             try:
@@ -2783,16 +2793,11 @@ class DeviceClient(object):
         # ------------------------------------------------------------------ #
         # HTTP-first ICE config pre-fetch (matches official app behaviour)
         # ------------------------------------------------------------------ #
-        # Try the HTTP endpoint before starting MQTT so TURN credentials are
-        # available immediately when RTCPeerConnection is created, without
-        # waiting for the 3–12 s MQTT wake cycle.  Skipped on DTLS-fallback
-        # retries (_skip_ice_config=True) and when the caller already supplied
-        # _ice_config from a prior attempt.
-        _http_ice_config: Optional[dict] = None
-        if not _skip_ice_config and _ice_config is None:
-            _http_ice_config = await self.async_get_ice_config_http()
+        # HTTP ICE config was fetched concurrently with batchGetDeviceUserInfo
+        # above (parallel gather).  Just log the outcome here.
+        if _fetch_http_ice:
             if _http_ice_config:
-                _status("ICE config fetched via HTTP (primary path)")
+                _status("ICE config fetched via HTTP (primary path, parallel fetch)")
             else:
                 _status("HTTP ICE config unavailable — will use MQTT path")
 
@@ -3160,7 +3165,12 @@ class DeviceClient(object):
             # only send here for the DTLS path to avoid a duplicate.
             outgoing_q.put_nowait((live_play_topic, _live_req_payload))
             _status(f"livePlayReq sent  peerid={peer_id}")
-            await asyncio.sleep(0.5)
+            # Wait for the broker to echo livePlayReq back (confirms delivery).
+            # Proceed as soon as the echo arrives; fall through after 0.5 s.
+            try:
+                await asyncio.wait_for(liveplay_echo_ev.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
             # Short extra wait for getIceConfigResp — the server may only respond
             # once a live camera session is active (i.e. after livePlayReq).
             # Waiting here ensures TURN credentials arrive before RTCPeerConnection
@@ -3825,7 +3835,7 @@ class DeviceClient(object):
             _status("webrtcReq echo received — waiting briefly for camera webrtcResp...")
             _rr_done2, _rr_pending2 = await asyncio.wait(
                 _rr_pending,   # {answer_fut, camera_offer_fut}
-                timeout=6.0,
+                timeout=3.0,   # 3 s is generous; real responses arrive in <1 s with userUuid fix
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if _rr_done2:
@@ -4025,9 +4035,26 @@ class DeviceClient(object):
             # doesn't arrive).  Must be done after _rr_cam_ports is populated and after
             # setRemoteDescription so aiortc is in ICE "checking" state when the ICE wait
             # loop picks up the candidate and calls addIceCandidate.
-            if _cam_local_ip and _rr_cam_ports and cam_ip_q.empty():
+            #
+            # IMPORTANT: Skip for echo-only cameras.  In echo-only mode the camera's
+            # "counter-offer" is our own echoed webrtcReq, so _rr_cam_ports contains our
+            # aiortc-allocated ports (e.g. 60705/47324), not the camera's listening ports.
+            # Injecting synthetic host candidates as {camera_IP}:{our_port} sends STUN
+            # probes to an address the camera never listens on, consuming the full ICE
+            # timeout with no hope of success.  Instead rely on:
+            #   1. Arnoo TURN relay (already appended to _ice_servers when no TURN in
+            #      getIceConfigResp) — lets the camera reach us via relay.
+            #   2. second_answer_fut candidates (processed in ICE wait loop below) if the
+            #      camera sends a real webrtcResp after receiving our webrtcResp.
+            if _cam_local_ip and _rr_cam_ports and cam_ip_q.empty() and not _rr_echo_only:
                 cam_ip_q.put_nowait(_cam_local_ip)
                 _status(f"pre-seeded cam_ip_q from user-info IP: {_cam_local_ip}")
+            elif _rr_echo_only and _rr_cam_ports:
+                _status(
+                    f"echo-only: skipping cam_ip_q pre-seed"
+                    f" (echo ports are ours: {[p for _, _, p in _rr_cam_ports]})"
+                    f" — relying on TURN relay and second_answer_fut candidates"
+                )
 
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
             # setup value is role-dependent (see comment above the synth-SDP replace):
