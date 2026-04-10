@@ -3818,6 +3818,7 @@ class DeviceClient(object):
 
         # Echo-reversal path: echo arrived but no proper response yet.
         # Give the camera a brief secondary window to send its real reply.
+        _rr_echo_only = False  # True only for cameras that echo but never send a real webrtcResp
         if (webrtc_req_echo_fut in _rr_done
                 and answer_fut not in _rr_done
                 and camera_offer_fut not in _rr_done):
@@ -3833,6 +3834,7 @@ class DeviceClient(object):
             else:
                 # Echo-only camera (e.g. LK.IPC.A001064): use echo SDP as
                 # the camera's counter-offer so the role-reversal path fires.
+                _rr_echo_only = True
                 _status(
                     "echo-reversal: no real webrtcResp after echo"
                     " — using echo SDP as camera offer (role-reversal)"
@@ -3984,12 +3986,21 @@ class DeviceClient(object):
                 )
             # Camera sends media to us → its answer direction is sendonly.
             _rr_synth_sdp = _rr_synth_sdp.replace('a=recvonly\r\n', 'a=sendonly\r\n')
-            # DTLS: camera's real second answer says a=setup:passive (camera is DTLS
-            # passive/server).  Tell aiortc the remote is passive so aiortc becomes
-            # DTLS active/client and initiates the ClientHello after ICE connects.
+            # DTLS setup role depends on whether the camera is echo-only or real-reversal.
+            # Echo-only (e.g. LK.IPC.A001064): camera never sends its own webrtcResp, so
+            # we cannot know its DTLS preference.  We declare setup:passive in our
+            # webrtcResp, making the camera DTLS active/ICE-controlling.  The camera then
+            # allocates a TURN relay and sends iceCandidateReq → ICE connects via relay.
+            # Tell aiortc the remote is DTLS active so aiortc becomes passive/server.
+            # RFC 5763: remote=active → local=passive (server).
+            #
+            # Real role-reversal (camera sent setup:passive in its second webrtcResp):
+            # we send setup:active so we are DTLS client and initiate the ClientHello.
+            # Tell aiortc the remote is passive so aiortc becomes active/client.
             # RFC 5763: remote=passive → local=active (client).
             _rr_synth_sdp = _rr_synth_sdp.replace(
-                'a=setup:actpass\r\n', 'a=setup:passive\r\n'
+                'a=setup:actpass\r\n',
+                'a=setup:active\r\n' if _rr_echo_only else 'a=setup:passive\r\n'
             )
             try:
                 await pc.setRemoteDescription(
@@ -4019,18 +4030,16 @@ class DeviceClient(object):
                 _status(f"pre-seeded cam_ip_q from user-info IP: {_cam_local_ip}")
 
             # Send webrtcResp so the camera knows our DTLS fingerprint and ICE params.
-            # The camera's real second answer (second webrtcResp) declares a=setup:passive —
-            # the camera acts as DTLS server (passive).  We must be the DTLS client (active)
-            # so we initiate the ClientHello after ICE connects.
-            # RFC 5763: if remote=passive → local=active (client).
-            # The synthetic remote SDP above already sets a=setup:passive so aiortc
-            # becomes DTLS active/client internally.  We also declare setup:active in our
-            # webrtcResp so the camera's SDP parser sees a consistent role assignment and
-            # doesn't wait for a ClientHello from us when we are the one initiating it.
+            # setup value is role-dependent (see comment above the synth-SDP replace):
+            #   echo-only  → setup:passive (we are DTLS server; camera is DTLS client/
+            #                               ICE-controlling; camera allocates relay and
+            #                               sends iceCandidateReq → ICE via TURN relay)
+            #   real-reversal → setup:active (we initiate DTLS ClientHello after ICE)
             # aiortc generates SDPs with \r\n so a simple replace is safe here.
+            _rr_setup_val = "passive" if _rr_echo_only else "active"
             _rr_answer_sdp = _normalize_bundle_ice_credentials(
                 pc.localDescription.sdp.replace(
-                    "a=setup:actpass\r\n", "a=setup:active\r\n"
+                    "a=setup:actpass\r\n", f"a=setup:{_rr_setup_val}\r\n"
                 )
             )
             _webrtc_resp_topic   = f"iot/v1/s/{user_id}/IPC/webrtcResp"
@@ -4060,7 +4069,7 @@ class DeviceClient(object):
                 },
             })
             outgoing_q.put_nowait((_webrtc_resp_topic, _webrtc_resp_payload))
-            _status("webrtcResp sent (role-reversal answer, setup=active)")
+            _status(f"webrtcResp sent (role-reversal answer, setup={_rr_setup_val})")
 
             # Re-announce ALL our gathered ICE candidates (host + srflx/prflx) after
             # sending webrtcResp.  The @pc.on("icecandidate") callbacks fired during
