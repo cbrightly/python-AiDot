@@ -3223,6 +3223,7 @@ class DeviceClient(object):
                         ice_config_fut.result() if ice_config_fut.done()
                         else _http_ice_config
                     ),
+                    camera_reconnect_ev=camera_reconnect_ev,
                 )
             except DeviceClient._SdesNoAnswerError:
                 # Camera reported enableSdes='1' but did not respond to our SDES
@@ -4270,7 +4271,7 @@ class DeviceClient(object):
         _last_ice_log = time.monotonic()
         _devattr_midloop_sent = False  # guard: send getDevAttrReq once at half-timeout
         _second_ans_processed = False  # guard: process second_answer_fut candidates once
-        _reconnect_resent     = False  # guard: re-send webrtcResp+ICE once on reconnect
+        _reconnect_resent_count = 0   # counter: re-send webrtcResp+ICE on each reconnect (max 3)
         while not connected_ev.is_set() and time.monotonic() < deadline:
             # Drain incoming ICE candidates from the camera
             while True:
@@ -4412,9 +4413,9 @@ class DeviceClient(object):
             # Guard: only for echo-only role-reversal cameras (_rr_webrtc_resp_payload
             # is empty for all other paths) and at most once per session.
             if (camera_reconnect_ev.is_set()
-                    and not _reconnect_resent
+                    and _reconnect_resent_count < 3
                     and _rr_webrtc_resp_payload):
-                _reconnect_resent = True
+                _reconnect_resent_count += 1
                 camera_reconnect_ev.clear()
                 _status(
                     "camera reconnected during ICE"
@@ -4487,6 +4488,7 @@ class DeviceClient(object):
         dtls_fallback_ok: bool = True,
         second_answer_fut=None,
         ice_config: "Optional[dict]" = None,
+        camera_reconnect_ev=None,
     ) -> "SdesSession":
         """SDES-SRTP streaming path using a hand-crafted SDP offer and ffmpeg.
 
@@ -4781,6 +4783,8 @@ class DeviceClient(object):
         # is_echo=True, which is exactly what webrtc_req_echo_fut signals.
         _echo_fut = webrtc_req_echo_fut if webrtc_req_echo_fut is not None else camera_offer_fut
         _cam_echo_received = False
+        _webrtc_resp_sdes_topic: "Optional[str]" = None
+        _webrtc_resp_sdes: "Optional[str]" = None
         try:
             await _asyncio.wait_for(
                 _asyncio.shield(_echo_fut), timeout=2.0
@@ -4883,6 +4887,37 @@ class DeviceClient(object):
             + (f"  srflx={_public_ip}" if _public_ip else "")
         )
 
+        # --- NAT hole-punch: create outbound UDP mapping before STUN window --- #
+        # Without a prior outbound packet from each socket, most home-router NATs
+        # have no mapping for those ports and silently drop the inbound STUN
+        # binding requests from the camera.  Sending a minimal STUN binding-
+        # request packet to an external host forces the router to create a NAT
+        # entry so the camera's probes are forwarded to our sockets.
+        _hp_host = "3.230.182.123"   # fallback: Arnoo TURN server
+        _hp_port = 3478
+        try:
+            if _sdes_turn_entries:
+                import re as _re_hp
+                _hp_uri = str(
+                    (_sdes_turn_entries[0].get("Uris") or [""])[0]
+                )
+                _m_hp = _re_hp.search(r'turns?:([^:?]+)(?::(\d+))?', _hp_uri)
+                if _m_hp:
+                    _hp_host = _m_hp.group(1)
+                    _hp_port = int(_m_hp.group(2) or 3478)
+        except Exception:
+            pass
+        _hp_stun = b'\x00\x01\x00\x00\x21\x12\xa4\x42' + os.urandom(12)
+        for _hp_sock in (_audio_sock, _video_sock):
+            try:
+                _hp_sock.sendto(_hp_stun, (_hp_host, _hp_port))
+            except Exception:
+                pass
+        _status(
+            f"NAT hole-punch: sent from audio={audio_port}"
+            f" video={video_port} → {_hp_host}:{_hp_port}"
+        )
+
         # --- ICE STUN responder (runs while reservation sockets are still open) #
         # Two-phase window:
         #   Normal (no echo-reversal): exit after 0.5 s idle, max 2.5 s total.
@@ -4962,6 +4997,106 @@ class DeviceClient(object):
             _status(f"ICE: responded to {_stun_count} STUN binding request(s)")
         if _srtp_detected:
             _status("SRTP detected — exiting STUN window, handing off to ffmpeg")
+
+        # --- Reconnect retry: camera may quickConn during synchronous STUN window #
+        # LK.IPC.A001064 performs an MQTT disconnect+reconnect (quickConn) after
+        # receiving WebRTC signaling.  The synchronous select() loop above blocks
+        # asyncio entirely, so camera_reconnect_ev.set() is queued but not
+        # processed until asyncio.sleep(0) runs.  After flushing the queue, check
+        # for the reconnect and re-send webrtcResp + ICE candidates so the camera
+        # can restart its ICE agent.  Allow up to 2 retries.
+        _sdes_retries = 0
+        while (_cam_echo_received
+               and _stun_count == 0
+               and not _srtp_detected
+               and camera_reconnect_ev is not None
+               and _sdes_retries < 2):
+            await asyncio.sleep(0)   # flush queued callbacks (reconnect_ev.set())
+            if not camera_reconnect_ev.is_set():
+                break
+            camera_reconnect_ev.clear()
+            _sdes_retries += 1
+            _status(
+                f"camera reconnected during SDES ICE window (retry {_sdes_retries})"
+                " — re-sending webrtcResp + ICE candidates"
+            )
+            await asyncio.sleep(0.3)   # let camera re-subscribe before re-send
+            if _webrtc_resp_sdes is not None:
+                outgoing_q.put_nowait((_webrtc_resp_sdes_topic, _webrtc_resp_sdes))
+            for _ice_mid_r, _ice_port_r in (("0", audio_port), ("1", video_port)):
+                _send_sdes_ice_cand(
+                    f"candidate:1 1 udp 2130706431 {local_ip} {_ice_port_r}"
+                    " typ host",
+                    _ice_mid_r,
+                )
+                if _public_ip:
+                    _send_sdes_ice_cand(
+                        f"candidate:2 1 udp 1694498815 {_public_ip} {_ice_port_r}"
+                        f" typ srflx raddr {local_ip} rport {_ice_port_r}",
+                        _ice_mid_r,
+                    )
+            # Refresh NAT mapping so router allows new inbound STUN from camera
+            for _hp_sock_r in (_audio_sock, _video_sock):
+                try:
+                    _hp_sock_r.sendto(_hp_stun, (_hp_host, _hp_port))
+                except Exception:
+                    pass
+            # Retry STUN window (8 s)
+            _stun_deadline = time.monotonic() + 8.0
+            _last_pkt_t = time.monotonic()
+            _stun_seen = False
+            while time.monotonic() < _stun_deadline:
+                if _stun_seen and time.monotonic() - _last_pkt_t > _idle_limit:
+                    break
+                try:
+                    _rlist_r, _, _ = _select.select(
+                        [_audio_sock, _video_sock], [], [], 0.1
+                    )
+                except Exception:
+                    break
+                for _sk_r in _rlist_r:
+                    _last_pkt_t = time.monotonic()
+                    try:
+                        _pkt_r, _src_r = _sk_r.recvfrom(2048)
+                    except OSError:
+                        continue
+                    if (len(_pkt_r) >= 20
+                            and _pkt_r[:2] == b'\x00\x01'
+                            and _pkt_r[4:8] == _STUN_MAGIC):
+                        _stun_seen = True
+                        _tid_r = _pkt_r[8:20]
+                        try:
+                            _ip_r = [int(x) for x in _src_r[0].split('.')]
+                            _xip_r = bytes(
+                                a ^ b for a, b in zip(
+                                    _struct.pack('!4B', *_ip_r), _STUN_MAGIC
+                                )
+                            )
+                            _xport_r = (_src_r[1] ^ 0x2112) & 0xFFFF
+                            _xma_r = (b'\x00\x20\x00\x08\x00\x01'
+                                      + _struct.pack('!H', _xport_r) + _xip_r)
+                            _resp_r = (b'\x01\x01'
+                                       + _struct.pack('!H', len(_xma_r))
+                                       + _STUN_MAGIC + _tid_r + _xma_r)
+                            _sk_r.sendto(_resp_r, _src_r)
+                            _stun_count += 1
+                        except Exception:
+                            pass
+                    else:
+                        _srtp_detected = True
+                        break
+                if _srtp_detected:
+                    break
+            if _stun_count:
+                _status(
+                    f"ICE retry {_sdes_retries}:"
+                    f" responded to {_stun_count} STUN binding request(s)"
+                )
+            if _srtp_detected:
+                _status(
+                    f"SRTP detected in retry {_sdes_retries}"
+                    " — exiting STUN window, handing off to ffmpeg"
+                )
 
         # --- Harvest camera's webrtcResp answer (may have arrived during STUN window) --- #
         # The asyncio event loop was blocked by the synchronous STUN loop.  Any
