@@ -5791,6 +5791,7 @@ class DeviceClient(object):
             _LOGGER.warning("bridge: could not rewrite SDP: %s", _br_sdp_exc)
 
         def _bridge_fn():
+            nonlocal _br_first_di_logged, _br_first_srtp_logged
             _STUN_MAGIC_BR = b'\x21\x12\xa4\x42'
             import struct as _st_br, select as _sel_br
             _lo_a = _socket_br.socket(_socket_br.AF_INET, _socket_br.SOCK_DGRAM)
@@ -5818,6 +5819,12 @@ class DeviceClient(object):
                         if (len(_bpkt) >= 20
                                 and _bpkt[:2] == b'\x00\x17'
                                 and _bpkt[4:8] == _STUN_MAGIC_BR):
+                            if not _br_first_di_logged:
+                                _br_first_di_logged = True
+                                _status(
+                                    f"bridge: first Data Indication from"
+                                    f" {_bsrc[0]}:{_bsrc[1]}"
+                                )
                             _br_off = 20
                             _br_inner = None
                             while _br_off + 4 <= len(_bpkt):
@@ -5914,6 +5921,13 @@ class DeviceClient(object):
                                 _lo_audio_port if _bs is _audio_sock
                                 else _lo_video_port
                             )
+                            if not _br_first_srtp_logged:
+                                _br_first_srtp_logged = True
+                                _status(
+                                    f"bridge: first SRTP from"
+                                    f" {_bsrc[0]}:{_bsrc[1]}"
+                                    f" → loopback:{_btgt}"
+                                )
                             try:
                                 (_lo_a if _bs is _audio_sock else _lo_v).sendto(
                                     _bpkt, ('127.0.0.1', _btgt)
@@ -5929,6 +5943,9 @@ class DeviceClient(object):
                     _lo_v.close()
                 except Exception:
                     pass
+
+        _br_first_di_logged = False
+        _br_first_srtp_logged = False
 
         _bridge_thread = _threading_br.Thread(
             target=_bridge_fn, daemon=True, name="sdes-bridge"
