@@ -5052,30 +5052,45 @@ class DeviceClient(object):
                     _xp = _st_ta.unpack_from('!H', _av, 2)[0] ^ 0x2112
                     _xb = bytes(a ^ b for a, b in zip(_av[4:8], _MAGIC_TA))
                     _r_ip_ta = '.'.join(str(b) for b in _xb)
-                    # CreatePermission for TURN server IP so Data Indications arrive
-                    # when camera uses the same relay server (same IP, dynamic port).
-                    _perm_xip = bytes(
-                        a ^ b for a, b in zip(
-                            bytes(int(x) for x in _ta_host.split('.')), _MAGIC_TA
+                    # CreatePermission: tell TURN server which peer source IP(s)
+                    # to accept SRTP from and forward as Data Indications.
+                    # Primary: camera's public IP (_public_ip, e.g. 72.84.199.230)
+                    # — this is the source IP the TURN server sees when the camera
+                    # sends SRTP to our relay (both camera and client behind same NAT).
+                    # Fallback to _ta_host (TURN server IP) if _public_ip unavailable.
+                    # Also send a second permission for _ta_host (belt-and-suspenders
+                    # in case camera routes via its own TURN allocation on same server).
+                    def _send_create_perm(_perm_ip_str):
+                        _pxip = bytes(
+                            a ^ b for a, b in zip(
+                                bytes(int(x) for x in _perm_ip_str.split('.')),
+                                _MAGIC_TA,
+                            )
                         )
-                    )
-                    _perm_xpa = b'\x00\x01' + _st_ta.pack('!H', 0x2112) + _perm_xip
-                    _bp = (
-                        _a(0x0006, _ta_user)
-                        + _a(0x0014, _realm_ta)
-                        + _a(0x0015, _nonce_ta)
-                        + _a(0x0012, _perm_xpa)   # XOR-PEER-ADDRESS (not CHANNEL-NUMBER)
-                    )
-                    _tp = os.urandom(12)
-                    _hp = (b'\x00\x08' + _st_ta.pack('!H', len(_bp) + 24)
-                           + _MAGIC_TA + _tp)
-                    _bp += _a(0x0008, _mi_ta(_key_ta, _hp + _bp))
-                    _cp = (b'\x00\x08' + _st_ta.pack('!H', len(_bp))
-                           + _MAGIC_TA + _tp + _bp)
-                    try:
-                        _ta_sock.sendto(_cp, (_ta_host, _ta_port))
-                    except Exception:
-                        pass
+                        _pxpa = b'\x00\x01' + _st_ta.pack('!H', 0x2112) + _pxip
+                        _pbp = (
+                            _a(0x0006, _ta_user)
+                            + _a(0x0014, _realm_ta)
+                            + _a(0x0015, _nonce_ta)
+                            + _a(0x0012, _pxpa)
+                        )
+                        _ptp = os.urandom(12)
+                        _php = (b'\x00\x08' + _st_ta.pack('!H', len(_pbp) + 24)
+                                + _MAGIC_TA + _ptp)
+                        _pbp += _a(0x0008, _mi_ta(_key_ta, _php + _pbp))
+                        _pcp = (b'\x00\x08' + _st_ta.pack('!H', len(_pbp))
+                                + _MAGIC_TA + _ptp + _pbp)
+                        _LOGGER.debug(
+                            "TURN CreatePermission for peer %s", _perm_ip_str)
+                        try:
+                            _ta_sock.sendto(_pcp, (_ta_host, _ta_port))
+                        except Exception:
+                            pass
+
+                    _perm_ip_primary = _public_ip if _public_ip else _ta_host
+                    _send_create_perm(_perm_ip_primary)
+                    if _ta_host != _perm_ip_primary:
+                        _send_create_perm(_ta_host)
                     return _r_ip_ta, _xp, _realm_ta, _nonce_ta
             return None
 
