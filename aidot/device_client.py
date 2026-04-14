@@ -6053,8 +6053,7 @@ class DeviceClient(object):
         # property means SDES is available, not that DTLS is absent.
         if (_cam_echo_received
                 and _stun_count == 0
-                and not _srtp_detected
-                and not _relay_addrs):
+                and not _srtp_detected):
             _status(
                 "echo-reversal camera: no STUN or SRTP received in ICE window"
                 " — camera likely requires DTLS; falling back"
