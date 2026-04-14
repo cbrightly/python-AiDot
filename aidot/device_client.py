@@ -5219,12 +5219,13 @@ class DeviceClient(object):
         _cam_echo_received = False
         _webrtc_resp_sdes_topic: "Optional[str]" = None
         _webrtc_resp_sdes: "Optional[str]" = None
+        _sdes_webrtcresp_sent = False   # True once we actually publish the SDES webrtcResp
         try:
             await _asyncio.wait_for(
                 _asyncio.shield(_echo_fut), timeout=2.0
             )
             _cam_echo_received = True
-            _status("camera webrtcReq echo received — sending webrtcResp to trigger streaming")
+            _status("camera webrtcReq echo received — building webrtcResp")
             # Seed _sdes_turn_entries from the echo's IceServerList if the HTTP
             # ice_config fetch returned nothing (empty list).  The echo carries
             # our userId TURN credentials — extract them so the hole-punch and
@@ -5352,7 +5353,22 @@ class DeviceClient(object):
                     },
                 },
             })
-            outgoing_q.put_nowait((_webrtc_resp_sdes_topic, _webrtc_resp_sdes))
+            if not dtls_fallback_ok:
+                # isDTLS='0': camera is pure SDES; send webrtcResp now so it knows
+                # where to stream SRTP.
+                outgoing_q.put_nowait((_webrtc_resp_sdes_topic, _webrtc_resp_sdes))
+                _sdes_webrtcresp_sent = True
+                _status("webrtcResp sent (SDES, isDTLS='0')")
+            else:
+                # dtls_fallback_ok: camera may be DTLS (e.g. LK.IPC.A001064).
+                # Sending a SDES webrtcResp would lock the camera into a stale SDES
+                # session, causing it to ignore the subsequent DTLS webrtcReq and
+                # only disconnect/reset ~20s later.  Suppress it here; the DTLS
+                # fallback will offer a clean DTLS session instead.
+                _status(
+                    "webrtcResp suppressed (dtls_fallback_ok)"
+                    " — will fall back to DTLS if no STUN/SRTP"
+                )
         except _asyncio.TimeoutError:
             pass  # no echo — camera uses a different signalling variant; proceed
 
@@ -5535,8 +5551,10 @@ class DeviceClient(object):
         # --- ICE STUN responder (runs while reservation sockets are still open) #
         # Two-phase window:
         #   Normal (no echo-reversal): exit after 0.5 s idle, max 2.5 s total.
-        #   Echo-reversal (A001064):   wait up to 8 s for ICE to start, then
-        #     exit 1.5 s after the last STUN packet (ICE silence = done).
+        #   Echo-reversal, SDES confirmed (webrtcResp sent): up to 20 s for ICE.
+        #   Echo-reversal, dtls_fallback_ok (webrtcResp suppressed): 5 s max —
+        #     camera won't stream without webrtcResp so no STUN/SRTP will arrive;
+        #     exit quickly so the DTLS fallback starts sooner.
         #   SRTP early exit: if a non-STUN packet arrives (SRTP), ICE is done —
         #     close sockets immediately so ffmpeg can bind.
         import struct as _struct, select as _select
@@ -5544,7 +5562,12 @@ class DeviceClient(object):
         _stun_count = 0
         _stun_seen = False
         _srtp_detected = False
-        _stun_max = 20.0 if _cam_echo_received else 2.5
+        if not _cam_echo_received:
+            _stun_max = 2.5
+        elif _sdes_webrtcresp_sent:
+            _stun_max = 20.0   # webrtcResp sent — camera may do ICE; give it time
+        else:
+            _stun_max = 5.0    # webrtcResp suppressed — no STUN expected; exit fast
         _idle_limit = 1.5      # exit after ICE silence once first STUN seen
         _pre_stun_idle = 0.5   # exit early if no packet at all (non-ICE camera)
         _stun_deadline = time.monotonic() + _stun_max
@@ -5704,7 +5727,10 @@ class DeviceClient(object):
                 " — re-sending webrtcResp + ICE candidates"
             )
             await asyncio.sleep(0.3)   # let camera re-subscribe before re-send
-            if _webrtc_resp_sdes is not None:
+            if _webrtc_resp_sdes is not None and _sdes_webrtcresp_sent:
+                # Only re-send webrtcResp if we sent it originally (isDTLS='0').
+                # For dtls_fallback_ok cameras the SDES session was intentionally
+                # suppressed — do not retroactively start one on reconnect.
                 outgoing_q.put_nowait((_webrtc_resp_sdes_topic, _webrtc_resp_sdes))
             for _ice_mid_r, _ice_port_r in (("0", audio_port), ("1", video_port)):
                 _send_sdes_ice_cand(
