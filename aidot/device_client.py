@@ -3834,6 +3834,10 @@ class DeviceClient(object):
                 })
             ))
 
+        # Store ICE candidates for reconnect re-send (camera may quickConn-reset
+        # during the signaling wait and need a fresh offer + candidates).
+        _dtls_ice_payloads: list = []  # list of (topic, json_str)
+
         # Forward our own ICE candidates to the camera via MQTT
         @pc.on("icecandidate")
         def _on_local_ice(candidate) -> None:
@@ -3901,6 +3905,7 @@ class DeviceClient(object):
                 },
             })
             outgoing_q.put_nowait((ice_cand_topic, payload))
+            _dtls_ice_payloads.append((ice_cand_topic, payload))
 
         # Wait for EITHER webrtcResp (normal) OR webrtcReq from camera (role reversal).
         # Some firmware (e.g. LK.IPC.A001064) responds to our offer by sending back
@@ -3924,17 +3929,45 @@ class DeviceClient(object):
         )
 
         # Echo-reversal path: echo arrived but no proper response yet.
-        # Give the camera a brief secondary window to send its real reply.
+        # Poll up to 20 s for a real webrtcResp; handle camera quickConn resets
+        # by re-sending webrtcReq + ICE candidates so the camera gets a fresh offer.
+        # LK.IPC.A001064: SDES path (run before us) poisons its session; camera
+        # resets (quickConn=1) on receiving our DTLS webrtcReq, then comes back
+        # clean after ~3-5 s.  Re-sending the offer after reconnect gets the
+        # camera to respond with its real DTLS answer in ~242 ms.
         _rr_echo_only = False  # True only for cameras that echo but never send a real webrtcResp
         if (webrtc_req_echo_fut in _rr_done
                 and answer_fut not in _rr_done
                 and camera_offer_fut not in _rr_done):
-            _status("webrtcReq echo received — waiting briefly for camera webrtcResp...")
-            _rr_done2, _rr_pending2 = await asyncio.wait(
-                _rr_pending,   # {answer_fut, camera_offer_fut}
-                timeout=3.0,   # 3 s is generous; real responses arrive in <1 s with userUuid fix
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            _status("webrtcReq echo received — waiting for camera webrtcResp...")
+            _rr_secondary_limit = 20.0
+            _rr_secondary_deadline = asyncio.get_event_loop().time() + _rr_secondary_limit
+            _rr_done2: set = set()
+            _rr_pending2 = _rr_pending   # {answer_fut, camera_offer_fut}
+            _rr_reconnect_resends = 0
+            while asyncio.get_event_loop().time() < _rr_secondary_deadline:
+                _remaining = _rr_secondary_deadline - asyncio.get_event_loop().time()
+                _rr_done2, _rr_pending2 = await asyncio.wait(
+                    _rr_pending2,
+                    timeout=min(1.0, max(0.01, _remaining)),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if _rr_done2:
+                    break   # Real response arrived
+                # Camera quickConn reset: came back clean, needs a fresh offer.
+                if (camera_reconnect_ev.is_set()
+                        and _rr_reconnect_resends < 2):
+                    camera_reconnect_ev.clear()
+                    _rr_reconnect_resends += 1
+                    _status(
+                        f"camera reconnected during webrtcResp wait"
+                        f" (resend {_rr_reconnect_resends})"
+                        " — re-sending webrtcReq + ICE candidates"
+                    )
+                    await asyncio.sleep(1.5)   # let camera re-subscribe
+                    outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
+                    for _di_p in _dtls_ice_payloads:
+                        outgoing_q.put_nowait(_di_p)
             if _rr_done2:
                 # Real response arrived — proceed normally
                 _rr_done, _rr_pending = _rr_done2, _rr_pending2
