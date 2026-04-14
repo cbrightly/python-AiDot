@@ -3972,16 +3972,58 @@ class DeviceClient(object):
                 # Real response arrived — proceed normally
                 _rr_done, _rr_pending = _rr_done2, _rr_pending2
             else:
-                # Echo-only camera (e.g. LK.IPC.A001064): use echo SDP as
-                # the camera's counter-offer so the role-reversal path fires.
-                _rr_echo_only = True
+                # No real webrtcResp in 20 s.  Camera (e.g. LK.IPC.A001064) is
+                # likely still in its prior SDES session (SDES webrtcReq was sent
+                # before us; camera waits ~25-30 s for a webrtcResp that never
+                # comes).  Re-send DTLS webrtcReq now and wait another 20 s;
+                # once the SDES session clears the camera answers in ~242 ms.
                 _status(
-                    "echo-reversal: no real webrtcResp after echo"
-                    " — using echo SDP as camera offer (role-reversal)"
+                    "echo-reversal: no real webrtcResp after 20 s"
+                    " — re-sending DTLS webrtcReq (camera clearing SDES session)"
                 )
-                camera_offer_fut.set_result(webrtc_req_echo_fut.result())
-                _rr_done    = {camera_offer_fut}
-                _rr_pending = _rr_pending2   # answer_fut cancelled below; camera_offer_fut cancel is no-op
+                outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
+                for _di_p in _dtls_ice_payloads:
+                    outgoing_q.put_nowait(_di_p)
+
+                _rr_ext_limit    = 20.0
+                _rr_ext_deadline = asyncio.get_event_loop().time() + _rr_ext_limit
+                _rr_done3: set   = set()
+                _rr_reconnect_ext = 0
+                while asyncio.get_event_loop().time() < _rr_ext_deadline:
+                    _ext_rem = _rr_ext_deadline - asyncio.get_event_loop().time()
+                    _rr_done3, _rr_pending2 = await asyncio.wait(
+                        _rr_pending2,
+                        timeout=min(1.0, max(0.01, _ext_rem)),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if _rr_done3:
+                        break
+                    if (camera_reconnect_ev.is_set()
+                            and _rr_reconnect_ext < 2):
+                        camera_reconnect_ev.clear()
+                        _rr_reconnect_ext += 1
+                        _status(
+                            f"camera reconnected (extended wait, resend {_rr_reconnect_ext})"
+                            " — re-sending DTLS webrtcReq"
+                        )
+                        await asyncio.sleep(1.5)
+                        outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
+                        for _di_p in _dtls_ice_payloads:
+                            outgoing_q.put_nowait(_di_p)
+
+                if _rr_done3:
+                    # Camera finally answered — proceed via normal path
+                    _rr_done, _rr_pending = _rr_done3, _rr_pending2
+                else:
+                    # Still no response after ~40 s total.  Last-resort role-reversal.
+                    _rr_echo_only = True
+                    _status(
+                        "echo-reversal: no real webrtcResp after extended wait"
+                        " — role-reversal as last resort"
+                    )
+                    camera_offer_fut.set_result(webrtc_req_echo_fut.result())
+                    _rr_done    = {camera_offer_fut}
+                    _rr_pending = _rr_pending2
 
         for _f in _rr_pending:
             _f.cancel()
