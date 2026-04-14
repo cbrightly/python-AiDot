@@ -4650,6 +4650,215 @@ class DeviceClient(object):
         except Exception:
             pass
 
+        # --- TURN relay allocation helper ------------------------------------ #
+        # Defined BEFORE the offer so relay IP/port can be embedded in the
+        # offer's c= and m= lines.  Pure-SDES cameras (no ICE) read the OFFER's
+        # c= address and stream SRTP there directly — if we put the relay address
+        # in the offer, the camera's SRTP reaches us through port-restricted NAT.
+        _relay_addrs: dict = {}  # sock → (relay_ip, relay_port, realm, nonce, t_host, t_port, key)
+
+        def _turn_allocate_udp(_ta_sock, _ta_host, _ta_port, _ta_user, _ta_pass):
+            """RFC 5766 TURN relay allocation with long-term credential auth.
+            Returns (relay_ip, relay_port, realm, nonce) or None on failure."""
+            import hashlib as _ha, hmac as _hm, struct as _st_ta, select as _sl_ta, time as _tm_ta
+
+            _MAGIC_TA = b'\x21\x12\xa4\x42'
+
+            def _a(_t, _v):
+                _p = (-len(_v)) % 4
+                return _st_ta.pack('!HH', _t, len(_v)) + _v + b'\x00' * _p
+
+            def _mi_ta(_k, _m):
+                # Patch Length to include the MI attribute (4 hdr + 20 digest = 24)
+                _patched = _m[:2] + _st_ta.pack('!H', len(_m) - 20 + 24) + _m[4:]
+                return _hm.new(_k, _patched, _ha.sha1).digest()
+
+            # Step 1: unauthenticated Allocate → get REALM and NONCE from 401
+            _tid1 = os.urandom(12)
+            _b1 = _a(0x0019, b'\x11\x00\x00\x00')  # REQUESTED-TRANSPORT = UDP(17), RFC 5766 §14.7 protocol in MSB
+            _r1 = b'\x00\x03' + _st_ta.pack('!H', len(_b1)) + _MAGIC_TA + _tid1 + _b1
+            try:
+                _ta_sock.sendto(_r1, (_ta_host, _ta_port))
+            except Exception:
+                return None
+            # Loop until we get a response whose TID matches our request (discard
+            # stale packets from previous exchanges that may linger in the buffer).
+            _rsp1 = None
+            _dl1 = _tm_ta.time() + 2.0
+            while _tm_ta.time() < _dl1:
+                _rem = _dl1 - _tm_ta.time()
+                _rs1, _, _ = _sl_ta.select([_ta_sock], [], [], min(_rem, 0.5))
+                if not _rs1:
+                    continue
+                try:
+                    _cand1, _ = _ta_sock.recvfrom(2048)
+                except OSError:
+                    break
+                if len(_cand1) >= 20 and _cand1[8:20] == _tid1:
+                    _rsp1 = _cand1
+                    break
+            if _rsp1 is None:
+                return None
+            _realm_ta = _nonce_ta = b''
+            _o = 20
+            while _o + 4 <= len(_rsp1):
+                _at, _al = _st_ta.unpack_from('!HH', _rsp1, _o)
+                _av = _rsp1[_o + 4:_o + 4 + _al]
+                _o += 4 + _al + (-_al % 4)
+                if _at == 0x0014:
+                    _realm_ta = _av
+                elif _at == 0x0015:
+                    _nonce_ta = _av
+            if not _realm_ta or not _nonce_ta:
+                _LOGGER.debug("TURN alloc step1: no realm/nonce in response type=%s",
+                              _rsp1[:2].hex())
+                return None
+            _LOGGER.debug("TURN alloc step1 challenge: realm=%r nonce_len=%d",
+                          _realm_ta.decode(errors='replace'), len(_nonce_ta))
+
+            # Step 2: authenticated Allocate
+            _tid2 = os.urandom(12)
+            _key_ta = _ha.md5(_ta_user + b':' + _realm_ta + b':' + _ta_pass).digest()
+            _b2 = (
+                _a(0x0006, _ta_user)                  # USERNAME
+                + _a(0x0014, _realm_ta)               # REALM
+                + _a(0x0015, _nonce_ta)               # NONCE
+                + _a(0x0019, b'\x11\x00\x00\x00')     # REQUESTED-TRANSPORT = UDP, RFC 5766 §14.7 protocol in MSB
+            )
+            _h2 = b'\x00\x03' + _st_ta.pack('!H', len(_b2) + 24) + _MAGIC_TA + _tid2
+            _b2 += _a(0x0008, _mi_ta(_key_ta, _h2 + _b2))  # MESSAGE-INTEGRITY
+            _r2 = b'\x00\x03' + _st_ta.pack('!H', len(_b2)) + _MAGIC_TA + _tid2 + _b2
+            try:
+                _ta_sock.sendto(_r2, (_ta_host, _ta_port))
+            except Exception:
+                return None
+            # Same TID-matching loop — if step 1's 401 was still in the buffer,
+            # a bare recvfrom would consume it and report failure on a good alloc.
+            _rsp2 = None
+            _dl2 = _tm_ta.time() + 2.0
+            while _tm_ta.time() < _dl2:
+                _rem = _dl2 - _tm_ta.time()
+                _rs2, _, _ = _sl_ta.select([_ta_sock], [], [], min(_rem, 0.5))
+                if not _rs2:
+                    continue
+                try:
+                    _cand2, _ = _ta_sock.recvfrom(2048)
+                except OSError:
+                    break
+                if len(_cand2) >= 20 and _cand2[8:20] == _tid2:
+                    _rsp2 = _cand2
+                    break
+            if _rsp2 is None:
+                return None
+            if _rsp2[:2] != b'\x01\x03':  # Allocate Success = 0x0103
+                # Parse ERROR-CODE (0x0009) for diagnostics
+                _ec2 = 0
+                _o_ec = 20
+                while _o_ec + 4 <= len(_rsp2):
+                    _at_ec, _al_ec = _st_ta.unpack_from('!HH', _rsp2, _o_ec)
+                    _av_ec = _rsp2[_o_ec + 4:_o_ec + 4 + _al_ec]
+                    _o_ec += 4 + _al_ec + (-_al_ec % 4)
+                    if _at_ec == 0x0009 and _al_ec >= 4:
+                        _ec2 = (_av_ec[2] & 0x07) * 100 + _av_ec[3]
+                _LOGGER.debug(
+                    "TURN alloc step2 error_code=%d realm=%r response_type=%s",
+                    _ec2, _realm_ta.decode(errors='replace'), _rsp2[:2].hex(),
+                )
+                return None
+
+            # Parse XOR-RELAYED-ADDRESS (0x0016)
+            _o = 20
+            while _o + 4 <= len(_rsp2):
+                _at, _al = _st_ta.unpack_from('!HH', _rsp2, _o)
+                _av = _rsp2[_o + 4:_o + 4 + _al]
+                _o += 4 + _al + (-_al % 4)
+                if _at == 0x0016 and _al >= 8:  # XOR-RELAYED-ADDRESS
+                    _xp = _st_ta.unpack_from('!H', _av, 2)[0] ^ 0x2112
+                    _xb = bytes(a ^ b for a, b in zip(_av[4:8], _MAGIC_TA))
+                    _r_ip_ta = '.'.join(str(b) for b in _xb)
+                    # CreatePermission: tell TURN server which peer source IP(s)
+                    # to accept SRTP from and forward as Data Indications.
+                    # Primary: camera's public IP (_public_ip, e.g. 72.84.199.230)
+                    # — this is the source IP the TURN server sees when the camera
+                    # sends SRTP to our relay (both camera and client behind same NAT).
+                    # Fallback to _ta_host (TURN server IP) if _public_ip unavailable.
+                    # Also send a second permission for _ta_host (belt-and-suspenders
+                    # in case camera routes via its own TURN allocation on same server).
+                    def _send_create_perm(_perm_ip_str):
+                        _pxip = bytes(
+                            a ^ b for a, b in zip(
+                                bytes(int(x) for x in _perm_ip_str.split('.')),
+                                _MAGIC_TA,
+                            )
+                        )
+                        _pxpa = b'\x00\x01' + _st_ta.pack('!H', 0x2112) + _pxip
+                        _pbp = (
+                            _a(0x0006, _ta_user)
+                            + _a(0x0014, _realm_ta)
+                            + _a(0x0015, _nonce_ta)
+                            + _a(0x0012, _pxpa)
+                        )
+                        _ptp = os.urandom(12)
+                        _php = (b'\x00\x08' + _st_ta.pack('!H', len(_pbp) + 24)
+                                + _MAGIC_TA + _ptp)
+                        _pbp += _a(0x0008, _mi_ta(_key_ta, _php + _pbp))
+                        _pcp = (b'\x00\x08' + _st_ta.pack('!H', len(_pbp))
+                                + _MAGIC_TA + _ptp + _pbp)
+                        _LOGGER.debug(
+                            "TURN CreatePermission for peer %s", _perm_ip_str)
+                        try:
+                            _ta_sock.sendto(_pcp, (_ta_host, _ta_port))
+                        except Exception:
+                            pass
+
+                    _perm_ip_primary = _public_ip if _public_ip else _ta_host
+                    _send_create_perm(_perm_ip_primary)
+                    if _ta_host != _perm_ip_primary:
+                        _send_create_perm(_ta_host)
+                    return _r_ip_ta, _xp, _realm_ta, _nonce_ta
+            return None
+
+        # --- Early TURN relay allocation (before offer build) --------------- #
+        # Allocate relay now so offer c= and m= carry relay IP/port.
+        # Camera reads offer's c= to know where to send SRTP — relay address
+        # here means SRTP reaches us even through port-restricted / hairpin NAT.
+        if _sdes_turn_entries:
+            try:
+                import re as _re_pre, hashlib as _hlk_pre
+                _our_te_pre = next(
+                    (e for e in _sdes_turn_entries if e.get("Username") == user_id),
+                    _sdes_turn_entries[0],
+                )
+                _t_uri_pre = next(
+                    (str(u) for u in (_our_te_pre.get("Uris") or []) if "turn:" in str(u)),
+                    ""
+                )
+                _tm_pre = _re_pre.search(r'turns?:([^:?]+)(?::(\d+))?', _t_uri_pre)
+                if _tm_pre:
+                    _t_host_pre = _tm_pre.group(1)
+                    _t_port_pre = int(_tm_pre.group(2) or 5349)
+                    _t_user_pre = (_our_te_pre.get("Username") or "").encode()
+                    _t_pass_pre = str(_our_te_pre.get("Password") or "").encode()
+                    for _pre_sock, _pre_name in ((_audio_sock, "audio"), (_video_sock, "video")):
+                        _pre_res = _turn_allocate_udp(
+                            _pre_sock, _t_host_pre, _t_port_pre, _t_user_pre, _t_pass_pre,
+                        )
+                        if _pre_res:
+                            _r_ip_pre, _r_port_pre, _r_realm_pre, _r_nonce_pre = _pre_res
+                            _r_key_pre = _hlk_pre.md5(
+                                _t_user_pre + b':' + _r_realm_pre + b':' + _t_pass_pre
+                            ).digest()
+                            _relay_addrs[_pre_sock] = (
+                                _r_ip_pre, _r_port_pre, _r_realm_pre, _r_nonce_pre,
+                                _t_host_pre, _t_port_pre, _r_key_pre,
+                            )
+                            _status(
+                                f"TURN relay pre-allocated (offer): {_pre_name}"
+                                f" → {_r_ip_pre}:{_r_port_pre}"
+                            )
+            except Exception as _pre_exc:
+                _LOGGER.warning("TURN pre-allocation error: %s", _pre_exc)
+
         # --- Build SDES SDP offer ------------------------------------------ #
         # AES_CM_128_HMAC_SHA1_80: 16-byte key + 14-byte salt = 30 bytes.
         srtp_key_audio = base64.b64encode(os.urandom(30)).decode()
@@ -4667,6 +4876,18 @@ class DeviceClient(object):
         _pwd_a   = _secrets.token_urlsafe(24)[:22]
         _ufrag_v = _secrets.token_urlsafe(4)[:4]
         _pwd_v   = _secrets.token_urlsafe(24)[:22]
+        # If relay was pre-allocated, embed relay IP/port in c= and m= so the
+        # camera sends SRTP to our TURN relay rather than our public IP.
+        # Fall back to local_ip (not _public_ip) so LAN cameras can reach us
+        # directly without hairpin NAT issues.
+        _offer_audio_ip   = (_relay_addrs[_audio_sock][0]
+                             if _audio_sock in _relay_addrs else local_ip)
+        _offer_audio_port = (_relay_addrs[_audio_sock][1]
+                             if _audio_sock in _relay_addrs else audio_port)
+        _offer_video_ip   = (_relay_addrs[_video_sock][0]
+                             if _video_sock in _relay_addrs else local_ip)
+        _offer_video_port = (_relay_addrs[_video_sock][1]
+                             if _video_sock in _relay_addrs else video_port)
         sdes_offer_sdp = (
             "v=0\r\n"
             f"o=- {ts} {ts} IN IP4 {local_ip}\r\n"
@@ -4676,8 +4897,8 @@ class DeviceClient(object):
             # a=crypto MUST precede ICE attributes (RFC 4568 §9.1) so that
             # linear-parsing camera firmware recognises this as an SDES offer
             # rather than a pure-ICE offer and does not discard the key.
-            f"m=audio {audio_port} RTP/SAVPF 0 8\r\n"
-            f"c=IN IP4 {_public_ip or local_ip}\r\n"
+            f"m=audio {_offer_audio_port} RTP/SAVPF 0 8\r\n"
+            f"c=IN IP4 {_offer_audio_ip}\r\n"
             "a=recvonly\r\n"
             "a=mid:0\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_audio}\r\n"
@@ -4698,9 +4919,15 @@ class DeviceClient(object):
                 f" typ srflx raddr {local_ip} rport {audio_port}\r\n"
                 if _public_ip else ""
             )
+            + (
+                f"a=candidate:3 1 udp 16777215 {_relay_addrs[_audio_sock][0]}"
+                f" {_relay_addrs[_audio_sock][1]}"
+                f" typ relay raddr {local_ip} rport {audio_port}\r\n"
+                if _audio_sock in _relay_addrs else ""
+            )
             # video m-section
-            + f"m=video {video_port} RTP/SAVPF 96 97\r\n"
-            f"c=IN IP4 {_public_ip or local_ip}\r\n"
+            + f"m=video {_offer_video_port} RTP/SAVPF 96 97\r\n"
+            f"c=IN IP4 {_offer_video_ip}\r\n"
             "a=recvonly\r\n"
             "a=mid:1\r\n"
             f"a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{srtp_key_video}\r\n"
@@ -4720,12 +4947,20 @@ class DeviceClient(object):
                 f" typ srflx raddr {local_ip} rport {video_port}\r\n"
                 if _public_ip else ""
             )
+            + (
+                f"a=candidate:3 1 udp 16777215 {_relay_addrs[_video_sock][0]}"
+                f" {_relay_addrs[_video_sock][1]}"
+                f" typ relay raddr {local_ip} rport {video_port}\r\n"
+                if _video_sock in _relay_addrs else ""
+            )
         )
 
         _status(
             f"SDP offer (SDES)  local={local_ip}"
             + (f"  srflx={_public_ip}" if _public_ip else "")
             + f"  audio={audio_port}  video={video_port}"
+            + (f"  relay-audio={_offer_audio_ip}:{_offer_audio_port}"
+               if _audio_sock in _relay_addrs else "")
         )
 
         # Send livePlayReq before the SDP offer to arm the camera's stream.
@@ -4926,174 +5161,6 @@ class DeviceClient(object):
         outgoing_q.put_nowait((webrtc_req_topic, _webrtc_req_sdes_payload))
         _status(f"webrtcReq sent (SDES)  peerid={peer_id}")
 
-        # --- TURN relay allocation helper ------------------------------------ #
-        # Defined here so the echo handler below can call it before sending
-        # webrtcResp.  Pure-SDES cameras read c= from our answer SDP and stream
-        # SRTP directly there — putting the relay IP in the answer is the only
-        # way camera traffic reaches us through port-restricted NAT.
-        _relay_addrs: dict = {}  # sock → (relay_ip, relay_port, realm, nonce, t_host, t_port, key)
-
-        def _turn_allocate_udp(_ta_sock, _ta_host, _ta_port, _ta_user, _ta_pass):
-            """RFC 5766 TURN relay allocation with long-term credential auth.
-            Returns (relay_ip, relay_port, realm, nonce) or None on failure."""
-            import hashlib as _ha, hmac as _hm, struct as _st_ta, select as _sl_ta, time as _tm_ta
-
-            _MAGIC_TA = b'\x21\x12\xa4\x42'
-
-            def _a(_t, _v):
-                _p = (-len(_v)) % 4
-                return _st_ta.pack('!HH', _t, len(_v)) + _v + b'\x00' * _p
-
-            def _mi_ta(_k, _m):
-                # Patch Length to include the MI attribute (4 hdr + 20 digest = 24)
-                _patched = _m[:2] + _st_ta.pack('!H', len(_m) - 20 + 24) + _m[4:]
-                return _hm.new(_k, _patched, _ha.sha1).digest()
-
-            # Step 1: unauthenticated Allocate → get REALM and NONCE from 401
-            _tid1 = os.urandom(12)
-            _b1 = _a(0x0019, b'\x11\x00\x00\x00')  # REQUESTED-TRANSPORT = UDP(17), RFC 5766 §14.7 protocol in MSB
-            _r1 = b'\x00\x03' + _st_ta.pack('!H', len(_b1)) + _MAGIC_TA + _tid1 + _b1
-            try:
-                _ta_sock.sendto(_r1, (_ta_host, _ta_port))
-            except Exception:
-                return None
-            # Loop until we get a response whose TID matches our request (discard
-            # stale packets from previous exchanges that may linger in the buffer).
-            _rsp1 = None
-            _dl1 = _tm_ta.time() + 2.0
-            while _tm_ta.time() < _dl1:
-                _rem = _dl1 - _tm_ta.time()
-                _rs1, _, _ = _sl_ta.select([_ta_sock], [], [], min(_rem, 0.5))
-                if not _rs1:
-                    continue
-                try:
-                    _cand1, _ = _ta_sock.recvfrom(2048)
-                except OSError:
-                    break
-                if len(_cand1) >= 20 and _cand1[8:20] == _tid1:
-                    _rsp1 = _cand1
-                    break
-            if _rsp1 is None:
-                return None
-            _realm_ta = _nonce_ta = b''
-            _o = 20
-            while _o + 4 <= len(_rsp1):
-                _at, _al = _st_ta.unpack_from('!HH', _rsp1, _o)
-                _av = _rsp1[_o + 4:_o + 4 + _al]
-                _o += 4 + _al + (-_al % 4)
-                if _at == 0x0014:
-                    _realm_ta = _av
-                elif _at == 0x0015:
-                    _nonce_ta = _av
-            if not _realm_ta or not _nonce_ta:
-                _LOGGER.debug("TURN alloc step1: no realm/nonce in response type=%s",
-                              _rsp1[:2].hex())
-                return None
-            _LOGGER.debug("TURN alloc step1 challenge: realm=%r nonce_len=%d",
-                          _realm_ta.decode(errors='replace'), len(_nonce_ta))
-
-            # Step 2: authenticated Allocate
-            _tid2 = os.urandom(12)
-            _key_ta = _ha.md5(_ta_user + b':' + _realm_ta + b':' + _ta_pass).digest()
-            _b2 = (
-                _a(0x0006, _ta_user)                  # USERNAME
-                + _a(0x0014, _realm_ta)               # REALM
-                + _a(0x0015, _nonce_ta)               # NONCE
-                + _a(0x0019, b'\x11\x00\x00\x00')     # REQUESTED-TRANSPORT = UDP, RFC 5766 §14.7 protocol in MSB
-            )
-            _h2 = b'\x00\x03' + _st_ta.pack('!H', len(_b2) + 24) + _MAGIC_TA + _tid2
-            _b2 += _a(0x0008, _mi_ta(_key_ta, _h2 + _b2))  # MESSAGE-INTEGRITY
-            _r2 = b'\x00\x03' + _st_ta.pack('!H', len(_b2)) + _MAGIC_TA + _tid2 + _b2
-            try:
-                _ta_sock.sendto(_r2, (_ta_host, _ta_port))
-            except Exception:
-                return None
-            # Same TID-matching loop — if step 1's 401 was still in the buffer,
-            # a bare recvfrom would consume it and report failure on a good alloc.
-            _rsp2 = None
-            _dl2 = _tm_ta.time() + 2.0
-            while _tm_ta.time() < _dl2:
-                _rem = _dl2 - _tm_ta.time()
-                _rs2, _, _ = _sl_ta.select([_ta_sock], [], [], min(_rem, 0.5))
-                if not _rs2:
-                    continue
-                try:
-                    _cand2, _ = _ta_sock.recvfrom(2048)
-                except OSError:
-                    break
-                if len(_cand2) >= 20 and _cand2[8:20] == _tid2:
-                    _rsp2 = _cand2
-                    break
-            if _rsp2 is None:
-                return None
-            if _rsp2[:2] != b'\x01\x03':  # Allocate Success = 0x0103
-                # Parse ERROR-CODE (0x0009) for diagnostics
-                _ec2 = 0
-                _o_ec = 20
-                while _o_ec + 4 <= len(_rsp2):
-                    _at_ec, _al_ec = _st_ta.unpack_from('!HH', _rsp2, _o_ec)
-                    _av_ec = _rsp2[_o_ec + 4:_o_ec + 4 + _al_ec]
-                    _o_ec += 4 + _al_ec + (-_al_ec % 4)
-                    if _at_ec == 0x0009 and _al_ec >= 4:
-                        _ec2 = (_av_ec[2] & 0x07) * 100 + _av_ec[3]
-                _LOGGER.debug(
-                    "TURN alloc step2 error_code=%d realm=%r response_type=%s",
-                    _ec2, _realm_ta.decode(errors='replace'), _rsp2[:2].hex(),
-                )
-                return None
-
-            # Parse XOR-RELAYED-ADDRESS (0x0016)
-            _o = 20
-            while _o + 4 <= len(_rsp2):
-                _at, _al = _st_ta.unpack_from('!HH', _rsp2, _o)
-                _av = _rsp2[_o + 4:_o + 4 + _al]
-                _o += 4 + _al + (-_al % 4)
-                if _at == 0x0016 and _al >= 8:  # XOR-RELAYED-ADDRESS
-                    _xp = _st_ta.unpack_from('!H', _av, 2)[0] ^ 0x2112
-                    _xb = bytes(a ^ b for a, b in zip(_av[4:8], _MAGIC_TA))
-                    _r_ip_ta = '.'.join(str(b) for b in _xb)
-                    # CreatePermission: tell TURN server which peer source IP(s)
-                    # to accept SRTP from and forward as Data Indications.
-                    # Primary: camera's public IP (_public_ip, e.g. 72.84.199.230)
-                    # — this is the source IP the TURN server sees when the camera
-                    # sends SRTP to our relay (both camera and client behind same NAT).
-                    # Fallback to _ta_host (TURN server IP) if _public_ip unavailable.
-                    # Also send a second permission for _ta_host (belt-and-suspenders
-                    # in case camera routes via its own TURN allocation on same server).
-                    def _send_create_perm(_perm_ip_str):
-                        _pxip = bytes(
-                            a ^ b for a, b in zip(
-                                bytes(int(x) for x in _perm_ip_str.split('.')),
-                                _MAGIC_TA,
-                            )
-                        )
-                        _pxpa = b'\x00\x01' + _st_ta.pack('!H', 0x2112) + _pxip
-                        _pbp = (
-                            _a(0x0006, _ta_user)
-                            + _a(0x0014, _realm_ta)
-                            + _a(0x0015, _nonce_ta)
-                            + _a(0x0012, _pxpa)
-                        )
-                        _ptp = os.urandom(12)
-                        _php = (b'\x00\x08' + _st_ta.pack('!H', len(_pbp) + 24)
-                                + _MAGIC_TA + _ptp)
-                        _pbp += _a(0x0008, _mi_ta(_key_ta, _php + _pbp))
-                        _pcp = (b'\x00\x08' + _st_ta.pack('!H', len(_pbp))
-                                + _MAGIC_TA + _ptp + _pbp)
-                        _LOGGER.debug(
-                            "TURN CreatePermission for peer %s", _perm_ip_str)
-                        try:
-                            _ta_sock.sendto(_pcp, (_ta_host, _ta_port))
-                        except Exception:
-                            pass
-
-                    _perm_ip_primary = _public_ip if _public_ip else _ta_host
-                    _send_create_perm(_perm_ip_primary)
-                    if _ta_host != _perm_ip_primary:
-                        _send_create_perm(_ta_host)
-                    return _r_ip_ta, _xp, _realm_ta, _nonce_ta
-            return None
-
         # --- Acknowledge camera's webrtcReq echo with webrtcResp ------------- #
         # LK.IPC.A001064 echoes our offer back as webrtcReq before doing ICE.
         # It will not start streaming until it receives a webrtcResp from us.
@@ -5131,53 +5198,52 @@ class DeviceClient(object):
                             })
                 except Exception:
                     pass
-            # Allocate TURN relay before sending webrtcResp so the relay IP/port
-            # can go into the answer SDP's c= and m= lines.  Pure-SDES cameras
-            # (no ICE) read our answer's c= and stream SRTP directly there —
-            # if we put the relay address here the camera can reach us even
-            # through port-restricted NAT.
-            try:
-                import re as _re_relay_e, hashlib as _hlk_e
-                _our_te = next(
-                    (e for e in _sdes_turn_entries if e.get("Username") == user_id),
-                    _sdes_turn_entries[0] if _sdes_turn_entries else None,
-                )
-                if _our_te:
-                    _t_uri_e = next(
-                        (str(u) for u in (_our_te.get("Uris") or [])
-                         if "turn:" in str(u)), ""
+            # Allocate TURN relay if not already done before offer build.
+            # When ice_config provided TURN entries, pre-allocation already ran
+            # and _relay_addrs is populated — skip to avoid double-allocation.
+            if not _relay_addrs:
+                try:
+                    import re as _re_relay_e, hashlib as _hlk_e
+                    _our_te = next(
+                        (e for e in _sdes_turn_entries if e.get("Username") == user_id),
+                        _sdes_turn_entries[0] if _sdes_turn_entries else None,
                     )
-                    _tm_e = _re_relay_e.search(
-                        r'turns?:([^:?]+)(?::(\d+))?', _t_uri_e
+                    if _our_te:
+                        _t_uri_e = next(
+                            (str(u) for u in (_our_te.get("Uris") or [])
+                             if "turn:" in str(u)), ""
+                        )
+                        _tm_e = _re_relay_e.search(
+                            r'turns?:([^:?]+)(?::(\d+))?', _t_uri_e
+                        )
+                        if _tm_e:
+                            _t_host_e = _tm_e.group(1)
+                            _t_port_e = int(_tm_e.group(2) or 5349)
+                            _t_user_e = (_our_te.get("Username") or "").encode()
+                            _t_pass_e = str(_our_te.get("Password") or "").encode()
+                            for _alloc_sock_e in (_audio_sock, _video_sock):
+                                _alloc_res_e = _turn_allocate_udp(
+                                    _alloc_sock_e, _t_host_e, _t_port_e,
+                                    _t_user_e, _t_pass_e,
+                                )
+                                if _alloc_res_e:
+                                    _r_ip_e, _r_port_e, _r_realm_e, _r_nonce_e = _alloc_res_e
+                                    _r_key_e = _hlk_e.md5(
+                                        _t_user_e + b':' + _r_realm_e + b':' + _t_pass_e
+                                    ).digest()
+                                    _relay_addrs[_alloc_sock_e] = (
+                                        _r_ip_e, _r_port_e, _r_realm_e, _r_nonce_e,
+                                        _t_host_e, _t_port_e, _r_key_e,
+                                    )
+                                    _status(
+                                        f"TURN relay allocated (echo fallback): "
+                                        f"{'audio' if _alloc_sock_e is _audio_sock else 'video'}"
+                                        f" → {_r_ip_e}:{_r_port_e}"
+                                    )
+                except Exception as _relay_early_exc:
+                    _LOGGER.warning(
+                        "TURN relay allocation error: %s", _relay_early_exc
                     )
-                    if _tm_e:
-                        _t_host_e = _tm_e.group(1)
-                        _t_port_e = int(_tm_e.group(2) or 5349)
-                        _t_user_e = (_our_te.get("Username") or "").encode()
-                        _t_pass_e = str(_our_te.get("Password") or "").encode()
-                        for _alloc_sock_e in (_audio_sock, _video_sock):
-                            _alloc_res_e = _turn_allocate_udp(
-                                _alloc_sock_e, _t_host_e, _t_port_e,
-                                _t_user_e, _t_pass_e,
-                            )
-                            if _alloc_res_e:
-                                _r_ip_e, _r_port_e, _r_realm_e, _r_nonce_e = _alloc_res_e
-                                _r_key_e = _hlk_e.md5(
-                                    _t_user_e + b':' + _r_realm_e + b':' + _t_pass_e
-                                ).digest()
-                                _relay_addrs[_alloc_sock_e] = (
-                                    _r_ip_e, _r_port_e, _r_realm_e, _r_nonce_e,
-                                    _t_host_e, _t_port_e, _r_key_e,
-                                )
-                                _status(
-                                    f"TURN relay allocated (early): "
-                                    f"{'audio' if _alloc_sock_e is _audio_sock else 'video'}"
-                                    f" → {_r_ip_e}:{_r_port_e}"
-                                )
-            except Exception as _relay_early_exc:
-                _LOGGER.warning(
-                    "TURN early relay allocation error: %s", _relay_early_exc
-                )
             # Build relay-aware answer SDP: relay IP/port in c= and m= so camera
             # sends SRTP to our relay.  Falls back to public/local IP if allocation
             # failed (same behaviour as before this change).
