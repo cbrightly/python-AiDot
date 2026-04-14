@@ -3764,6 +3764,13 @@ class DeviceClient(object):
                 _entry["Password"] = _srv.credential
             _ice_server_list.append(_entry)
 
+        import random as _rnd_psk_dtls
+        _psk_charset_dtls = "123456789abcdef"
+        _psk_dtls = "".join(
+            _psk_charset_dtls[_rnd_psk_dtls.randint(0, len(_psk_charset_dtls) - 1)]
+            for _ in range(64)
+        )
+
         webrtc_req_payload = json.dumps({
             "method":  "webrtcReq",
             "service": "IPC",
@@ -3780,6 +3787,8 @@ class DeviceClient(object):
                 # the canonical format; flat fields are kept for older firmware.
                 "wPayload": {
                     "peerid": peer_id,
+                    "sts":    int(time.time() * 1000),
+                    "psk":    _psk_dtls,
                     "offer":  {"type": pc.localDescription.type,
                                 "sdp":  _offer_sdp},
                 },
@@ -3796,6 +3805,8 @@ class DeviceClient(object):
                 # route the webrtcResp — wrong value causes response to be silently
                 # discarded or routed to the wrong endpoint.
                 "dstAddr": user_id,
+                "liveMqtt": 1,
+                "encOffer": 0,
             },
         })
         outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
