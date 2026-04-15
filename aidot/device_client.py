@@ -3806,7 +3806,7 @@ class DeviceClient(object):
                 # discarded or routed to the wrong endpoint.
                 "dstAddr": user_id,
                 "liveMqtt": 1,
-                "encOffer": 0,
+                "encOffer": 1,
             },
         })
         outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
@@ -5395,12 +5395,17 @@ class DeviceClient(object):
                     },
                 },
             })
-            # Echo cameras always reach _SdesNoAnswerError (no isDTLS guard).
-            # Non-echo SDES cameras (e.g. A001513) never enter this block.
-            # Sending webrtcResp here poisons the camera's session regardless
-            # of isDTLS value — suppress unconditionally; DTLS fallback will
-            # run on a clean camera state.
-            _status("webrtcResp suppressed (echo camera — DTLS fallback will run)")
+            # Send the relay-aware SDES webrtcResp so the camera knows to send
+            # SRTP to our TURN relay IP/port rather than our public IP (which is
+            # NAT-blocked for inbound connections).  Echo cameras (e.g. A001064)
+            # are SDES-only — the DTLS fallback can never succeed for them.
+            outgoing_q.put_nowait((_webrtc_resp_sdes_topic, _webrtc_resp_sdes))
+            _sdes_webrtcresp_sent = True
+            _status(
+                f"webrtcResp sent (SDES, relay-aware answer:"
+                f" audio={_ans_audio_ip}:{_ans_audio_port}"
+                f" video={_ans_video_ip}:{_ans_video_port})"
+            )
         except _asyncio.TimeoutError:
             pass  # no echo — camera uses a different signalling variant; proceed
 
@@ -6155,7 +6160,8 @@ class DeviceClient(object):
         # property means SDES is available, not that DTLS is absent.
         if (_cam_echo_received
                 and _stun_count == 0
-                and not _srtp_detected):
+                and not _srtp_detected
+                and not _relay_addrs):
             _status(
                 "echo-reversal camera: no STUN or SRTP received in ICE window"
                 " — camera likely requires DTLS; falling back"
