@@ -2785,6 +2785,7 @@ class DeviceClient(object):
         cam_ip_q:         asyncio.Queue   = asyncio.Queue()  # camera IP from setDevAttrNotif
         camera_ready_ev:  asyncio.Event   = asyncio.Event()  # set when camera is on MQTT
         liveplay_echo_ev: asyncio.Event   = asyncio.Event()  # set when livePlayReq echo arrives
+        liveplay_resp_fut: asyncio.Future = loop.create_future()  # set on livePlayResp
         camera_reconnect_ev: asyncio.Event = asyncio.Event() # set when camera sends device/connect
 
         # Gate: block asyncio until MQTT is connected + subscribed
@@ -2841,6 +2842,10 @@ class DeviceClient(object):
                     or inner.get("devId") == device_id
                     or msg.get("devId") == device_id):
                 loop.call_soon_threadsafe(camera_ready_ev.set)
+            # livePlayResp: explicit camera ack/nack for start-play command.
+            if method == "livePlayResp" and inner.get("devId") == device_id:
+                if not liveplay_resp_fut.done():
+                    loop.call_soon_threadsafe(liveplay_resp_fut.set_result, inner)
             # livePlayReq echo: broker/camera confirmed delivery of our livePlayReq.
             # Signal _open_sdes_stream to proceed with webrtcReq.
             if method == "livePlayReq" and inner.get("devId") == device_id:
@@ -3183,6 +3188,12 @@ class DeviceClient(object):
                 # Decompiled reference app (tyrus/o.java) sets payload.dstAddr
                 # to the target deviceId for livePlayReq.
                 "dstAddr": device_id,
+                # App payload compatibility fields (see LiveRequestParamsBean /
+                # LivePlayPaylodBean in decompiled app).
+                "livePlay": 1,
+                "powerType": "1",
+                "p2pCache": "0",
+                "dseq": 0,
             },
         })
         if not use_sdes:
@@ -3194,6 +3205,21 @@ class DeviceClient(object):
             # Proceed as soon as the echo arrives; fall through after 0.5 s.
             try:
                 await asyncio.wait_for(liveplay_echo_ev.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+            # livePlayResp carries camera-side accept/reject.  If the camera
+            # rejects start-play, continuing to SDP/ICE causes large STUN churn
+            # but no media.  Fail fast with the concrete code.
+            try:
+                _lp_resp = await asyncio.wait_for(
+                    asyncio.shield(liveplay_resp_fut), timeout=2.0
+                )
+                _lp_code = int(_lp_resp.get("code", 200))
+                _lp_on = int(_lp_resp.get("livePlay", 1))
+                if _lp_code not in (0, 200) or _lp_on == 0:
+                    raise RuntimeError(
+                        f"livePlay rejected by camera (code={_lp_code}, livePlay={_lp_on})"
+                    )
             except asyncio.TimeoutError:
                 pass
             # Short extra wait for getIceConfigResp — the server may only respond
@@ -3227,6 +3253,7 @@ class DeviceClient(object):
                     _status=_status,
                     mqtt_fut=mqtt_fut,
                     liveplay_echo_ev=liveplay_echo_ev,
+                    liveplay_resp_fut=liveplay_resp_fut,
                     numeric_uid_raw=_numeric_uid_raw,
                     dtls_fallback_ok=_dtls_fallback_ok,
                     second_answer_fut=second_answer_fut,
@@ -4631,6 +4658,7 @@ class DeviceClient(object):
         _status,
         mqtt_fut,
         liveplay_echo_ev,
+        liveplay_resp_fut,
         numeric_uid_raw=None,
         dtls_fallback_ok: bool = True,
         second_answer_fut=None,
@@ -5064,6 +5092,11 @@ class DeviceClient(object):
                 # Decompiled reference app (tyrus/o.java) sets payload.dstAddr
                 # to the target deviceId for livePlayReq.
                 "dstAddr": device_id,
+                # App payload compatibility fields (decompiled live-play model).
+                "livePlay": 1,
+                "powerType": "1",
+                "p2pCache": "0",
+                "dseq": 0,
             },
         })
         _live_play_topic_sdes = f"iot/v1/s/{user_id}/IPC/livePlayReq"
@@ -5079,6 +5112,19 @@ class DeviceClient(object):
             _status("livePlayReq echo received — sending webrtcReq, ICE, then launching ffmpeg")
         except _asyncio.TimeoutError:
             _status("no livePlayReq echo in 5s — sending webrtcReq, ICE, then launching ffmpeg anyway")
+        # If camera provided explicit livePlayResp failure, abort before SDP/ICE.
+        try:
+            _lp_resp_sdes = await _asyncio.wait_for(
+                _asyncio.shield(liveplay_resp_fut), timeout=1.0
+            )
+            _lp_code_sdes = int(_lp_resp_sdes.get("code", 200))
+            _lp_on_sdes = int(_lp_resp_sdes.get("livePlay", 1))
+            if _lp_code_sdes not in (0, 200) or _lp_on_sdes == 0:
+                raise RuntimeError(
+                    f"livePlay rejected by camera (code={_lp_code_sdes}, livePlay={_lp_on_sdes})"
+                )
+        except _asyncio.TimeoutError:
+            pass
 
         # --- Build local-receiver SDP for ffmpeg ----------------------------- #
         # Built BEFORE sending webrtcReq so ffmpeg is already listening on the
