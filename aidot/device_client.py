@@ -5708,6 +5708,15 @@ class DeviceClient(object):
             + (f" and :{_hp_port2}" if _hp_port != _hp_port2 else "")
         )
 
+        def _is_self_peer_ip(_ip: "Optional[str]") -> bool:
+            if not _ip:
+                return False
+            if _ip in {"127.0.0.1", "0.0.0.0", local_ip}:
+                return True
+            if _public_ip and _ip == _public_ip:
+                return True
+            return False
+
         # --- ICE STUN responder (runs while reservation sockets are still open) #
         # Two-phase window:
         #   Normal (no echo-reversal): exit after 0.5 s idle, max 2.5 s total.
@@ -5827,7 +5836,8 @@ class DeviceClient(object):
                                 ),
                                 magic_cookie=_STUN_MAGIC,
                             )
-                            if _turn_peer_ip_sw and _sock in _relay_addrs:
+                            if (_turn_peer_ip_sw and _sock in _relay_addrs
+                                    and not _is_self_peer_ip(_turn_peer_ip_sw)):
                                 # Arrived via TURN — respond via Send Indication
                                 _ri_sw = _relay_addrs[_sock]
                                 _t_host_sw, _t_port_sw = _ri_sw[4], _ri_sw[5]
@@ -5853,6 +5863,15 @@ class DeviceClient(object):
                                              + _STUN_MAGIC + os.urandom(12)
                                              + _si_body)
                                 _sock.sendto(_send_ind, (_t_host_sw, _t_port_sw))
+                            elif _turn_peer_ip_sw and _is_self_peer_ip(_turn_peer_ip_sw):
+                                # Self-loop Data Indication (peer == our own
+                                # local/srflx address). Responding via TURN
+                                # creates an endless STUN echo loop and no media.
+                                # Drop it and wait for real camera checks.
+                                _LOGGER.debug(
+                                    "STUN window: drop TURN self-loop peer %s:%s",
+                                    _turn_peer_ip_sw, _turn_peer_port_sw,
+                                )
                             else:
                                 _sock.sendto(_resp, _src)
                             _stun_count += 1
@@ -6194,7 +6213,8 @@ class DeviceClient(object):
                                     ),
                                     magic_cookie=_STUN_MAGIC_BR,
                                 )
-                                if _br_turn_peer_ip and _bs in _relay_addrs:
+                                if (_br_turn_peer_ip and _bs in _relay_addrs
+                                        and not _is_self_peer_ip(_br_turn_peer_ip)):
                                     # Arrived via TURN — respond via Send Indication
                                     _bri = _relay_addrs[_bs]
                                     _br_t_host, _br_t_port = _bri[4], _bri[5]
@@ -6229,6 +6249,11 @@ class DeviceClient(object):
                                     _bs.sendto(_br_send_ind, (_br_t_host, _br_t_port))
                                     _LOGGER.debug(
                                         "bridge: STUN resp via TURN → %s:%d",
+                                        _br_turn_peer_ip, _br_turn_peer_port,
+                                    )
+                                elif _br_turn_peer_ip and _is_self_peer_ip(_br_turn_peer_ip):
+                                    _LOGGER.debug(
+                                        "bridge: drop TURN self-loop STUN peer %s:%d",
                                         _br_turn_peer_ip, _br_turn_peer_port,
                                     )
                                 else:
