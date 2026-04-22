@@ -20,7 +20,7 @@ sequenceDiagram
     App->>MQTT: publish iot/v1/s/{userId}/IPC/livePlayReq
     App->>TCP: nativeSendMessageToTarget(...livePlayReq...)
     Note over App,MQTT: Dual channel send wrapper races MQTT+TCP
-    Note over App,TCP: First success wins; second success recorded as fallback ordering
+    Note over App,TCP: First success wins, second success recorded as fallback ordering
 
     App->>MQTT: publish iot/v1/s/{userId}/IPC/webrtcReq (offer)
     App->>TCP: nativeSendMessageToTarget(...webrtcReq...)
