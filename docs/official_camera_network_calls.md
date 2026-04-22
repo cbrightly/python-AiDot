@@ -17,10 +17,10 @@ sequenceDiagram
     App->>API: GET /v15/api/webrtc/iceConfig?forceRefresh=0 (headers: owner, token, terminal, appId, appVersion)
     API-->>App: ICE config JSON (cached to files/web/iceConfig/config.txt)
 
-    App->>MQTT: publish iot/v1/s/{userId}/IPC/livePlayReq
-    App->>TCP: nativeSendMessageToTarget(...livePlayReq...)
-    Note over App,MQTT: Dual channel send wrapper races MQTT+TCP
-    Note over App,TCP: First success wins, second success recorded as fallback ordering
+    App->>MQTT: publish iot/v1/s/{userId}/IPC/livePlayReq [dual channel send wrapper races MQTT+TCP]
+    App->>TCP: nativeSendMessageToTarget(...livePlayReq...) [first success wins, second recorded as fallback ordering]
+
+
 
     App->>MQTT: publish iot/v1/s/{userId}/IPC/webrtcReq (offer)
     App->>TCP: nativeSendMessageToTarget(...webrtcReq...)
