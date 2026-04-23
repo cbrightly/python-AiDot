@@ -1523,6 +1523,25 @@ class DeviceClient(object):
     def connecting(self) -> bool:
         return self._connecting
 
+    # Camera models that report ``enableSdes: '1'`` but whose SDES-SRTP
+    # implementation is non-functional on the wire.  Forced to the DTLS path.
+    #
+    # Evidence for LK.IPC.A001064 (research/webrtc_internals_dump.json +
+    # /tmp/aidot.log captures from this camera):
+    #   1. Official client always negotiates ``UDP/TLS/RTP/SAVPF`` +
+    #      ``a=fingerprint:sha-256`` + ``a=setup:active`` (DTLS-SRTP) for KVS
+    #      Leedarson firmware, regardless of the device's ``enableSdes`` flag.
+    #   2. When we drove the SDES path, ICE completed and the camera sent
+    #      packets, but ffmpeg reported ``HMAC mismatch`` on every packet.
+    #      The camera's announced master key decoded to 30 printable ASCII
+    #      chars (``P9vq4x2JHWA4yaqz15ubW0YnBnZuUT``) — a real random key has
+    #      ~10⁻¹³ probability of being all printable.  The SDES key is
+    #      placebo; the camera does not run SDES on the media path.
+    #   3. First non-STUN packet had ``byte0=0xC8`` (not RTP/RTCP/STUN/DTLS/
+    #      TURN-ChannelData) and SSRC ``3188308045`` (didn't match either
+    #      announced ssrc:5079 / 5077).  Bytes are not standard SRTP at all.
+    _DTLS_FORCED_MODELS: frozenset = frozenset({"LK.IPC.A001064"})
+
     @property
     def is_sdes_camera(self) -> bool:
         """True if the camera uses SDES-SRTP rather than DTLS-SRTP.
@@ -1531,11 +1550,18 @@ class DeviceClient(object):
         ``'1'`` → SDES explicitly enabled → SDES path.
         anything else → DTLS-SRTP path (default).
 
+        Models in ``_DTLS_FORCED_MODELS`` advertise ``enableSdes='1'`` but
+        their on-wire SDES-SRTP is broken (see class-level comment); they
+        are forced to the DTLS path.
+
         ``isDTLS: '0'`` is NOT used here — iOS app session captures confirm
         that cameras with ``isDTLS: '0'`` (e.g. LK.IPC.A000088) still respond
         with a full DTLS fingerprint answer.  ``enableSdes: '0'`` (the default)
         means SDES is disabled, so those cameras must use DTLS.
         """
+        model = getattr(getattr(self, "info", None), "model_id", None)
+        if model in self._DTLS_FORCED_MODELS:
+            return False
         props = getattr(self, "_raw_device", {}).get("properties") or {}
         return str(props.get("enableSdes", "0")) == "1"
 
