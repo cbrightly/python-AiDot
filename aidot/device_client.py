@@ -4844,6 +4844,24 @@ class DeviceClient(object):
         @pc.on("connectionstatechange")
         async def _on_conn_state() -> None:
             _status(f"WebRTC connectionState → {pc.connectionState}")
+            if pc.connectionState == "failed":
+                # Dump per-transceiver DTLS + ICE state so we can see which
+                # transport actually failed and why.  aiortc transitions
+                # connectionState to "failed" on the first transport that
+                # enters either dtlsTransport.state = "failed" or
+                # iceTransport.state = "failed".
+                try:
+                    for _i, _tc in enumerate(pc.getTransceivers()):
+                        _dtls = _tc.receiver.transport
+                        _ice  = _dtls.transport
+                        _status(
+                            f"  transceiver[{_i}] kind={_tc.receiver.track.kind if _tc.receiver.track else '?'}"
+                            f"  dtls.state={getattr(_dtls, 'state', '?')}"
+                            f"  ice.state={getattr(_ice, 'state', '?')}"
+                            f"  ice.role={getattr(getattr(_ice, '_connection', None), 'role', '?')}"
+                        )
+                except Exception as _diag_exc:
+                    _status(f"  transceiver state dump failed: {_diag_exc}")
             if pc.connectionState in ("connected", "completed"):
                 connected_ev.set()
             elif pc.connectionState in ("failed", "closed"):

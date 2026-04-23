@@ -150,6 +150,11 @@ async def run(args: argparse.Namespace) -> None:
     # Silence chatty third-party libraries that flood output even at --verbose.
     for _noisy in ("aiortc", "aioice", "aioice.ice"):
         _logging.getLogger(_noisy).setLevel(_logging.WARNING)
+    # …but keep DTLS transport at DEBUG: the DTLS handshake is currently the
+    # remaining failure mode for A001064 (ICE completes, then connectionState
+    # → failed before media flows).  This module logs the actual OpenSSL
+    # error / handshake state we need to diagnose further.
+    _logging.getLogger("aiortc.rtcdtlstransport").setLevel(_logging.DEBUG)
     async with aiohttp.ClientSession() as http_session:
         client = AidotClient(
             session=http_session,
