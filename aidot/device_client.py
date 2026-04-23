@@ -4953,6 +4953,52 @@ class DeviceClient(object):
                     f"async_open_webrtc_stream: setRemoteDescription failed: {exc}"
                 ) from exc
 
+            # --- Inbound-datagram byte-tap (diagnostic) -------------------- #
+            # Discriminates between "camera is silent until close_notify" vs
+            # "camera is sending SRTP / DTLS / STUN we're failing to handle".
+            # First byte tells the story:
+            #   0x00-0x03 = STUN  (binding req/resp, consent, etc.)
+            #   0x14-0x17 = DTLS records (0x15 = alert, e.g. close_notify)
+            #   0x80-0xBF = RTP/RTCP/SRTP/SRTCP
+            # Wrap each protocol's datagram_received on the live aioice
+            # Connection.  Includes monotonic timestamp so we can correlate
+            # against aiortc's untimestamped DEBUG transitions.
+            try:
+                import time as _bt_time
+                _bt_start = _bt_time.monotonic()
+                _ice_xport = pc.getTransceivers()[0].receiver.transport.transport
+                _aio_conn  = getattr(_ice_xport, "_connection", None)
+                _bt_protos = (
+                    list(getattr(_aio_conn, "_protocols", []) or [])
+                    if _aio_conn is not None else []
+                )
+
+                def _make_bt_tap(_orig_dr, _label):
+                    def _tap(data, addr):
+                        _dt = _bt_time.monotonic() - _bt_start
+                        try:
+                            _h8 = data[:8].hex() if data else ""
+                        except Exception:
+                            _h8 = "?"
+                        try:
+                            _status(
+                                f"RX {_label} t+{_dt:.3f}s {len(data)}B"
+                                f" from={addr} hex={_h8}"
+                            )
+                        except Exception:
+                            pass
+                        return _orig_dr(data, addr)
+                    return _tap
+
+                for _bp_idx, _bp in enumerate(_bt_protos):
+                    _orig = _bp.datagram_received
+                    _bp.datagram_received = _make_bt_tap(_orig, f"p{_bp_idx}")
+                _status(
+                    f"byte-tap installed on {len(_bt_protos)} aioice protocol(s)"
+                )
+            except Exception as _bt_install_exc:
+                _status(f"byte-tap install failed: {_bt_install_exc}")
+
             # Extract ICE candidates embedded in the SDP answer body.
             # The AiDot camera includes its host candidate as a=candidate: lines
             # inside the answer SDP.  The browser WebRTC API processes these
