@@ -4017,11 +4017,40 @@ class DeviceClient(object):
         # Note: _patch_answer_mid2_for_aiortc is no longer needed.  With 3-section
         # SDP the camera's answer mid:1=H264 video and mid:2=datachannel — aiortc
         # accepts both without patching.
-        _rr_done, _rr_pending = await asyncio.wait(
-            {answer_fut, camera_offer_fut, webrtc_req_echo_fut},
-            timeout=timeout,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        # Initial signaling wait: poll so we can also notice a quickConn reset
+        # that arrives BEFORE any of the three signaling futures fire.  Some
+        # firmware (LK.IPC.A001064 with isDTLS=0/enableSdes=1) drops the MQTT
+        # session immediately on receiving our DTLS webrtcReq — neither echoes
+        # it back nor sends a webrtcResp — and only re-subscribes ~3 s later.
+        # Without re-publishing webrtcReq + ICE candidates after the reconnect,
+        # the camera silently ignores the original request and we time out.
+        _init_done: set = set()
+        _init_pending: set = {answer_fut, camera_offer_fut, webrtc_req_echo_fut}
+        _init_deadline = asyncio.get_event_loop().time() + timeout
+        _init_reconnect_resends = 0
+        while asyncio.get_event_loop().time() < _init_deadline:
+            _init_remaining = _init_deadline - asyncio.get_event_loop().time()
+            _init_done, _init_pending = await asyncio.wait(
+                _init_pending,
+                timeout=min(1.0, max(0.01, _init_remaining)),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if _init_done:
+                break
+            if (camera_reconnect_ev.is_set()
+                    and _init_reconnect_resends < 2):
+                camera_reconnect_ev.clear()
+                _init_reconnect_resends += 1
+                _status(
+                    f"camera quickConn-reset before signaling reply"
+                    f" (resend {_init_reconnect_resends})"
+                    " — re-sending DTLS webrtcReq + ICE candidates"
+                )
+                await asyncio.sleep(1.5)   # let camera re-subscribe to MQTT
+                outgoing_q.put_nowait((webrtc_req_topic, webrtc_req_payload))
+                for _di_p in _dtls_ice_payloads:
+                    outgoing_q.put_nowait(_di_p)
+        _rr_done, _rr_pending = _init_done, _init_pending
 
         # Echo-reversal path: echo arrived but no proper response yet.
         # Poll up to 20 s for a real webrtcResp; handle camera quickConn resets
