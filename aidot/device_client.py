@@ -6206,7 +6206,7 @@ class DeviceClient(object):
             _LOGGER.warning("bridge: could not rewrite SDP: %s", _br_sdp_exc)
 
         def _bridge_fn():
-            nonlocal _br_first_di_logged, _br_first_srtp_logged
+            nonlocal _br_first_di_logged, _br_first_srtp_logged, _br_first_req_dumped
             _STUN_MAGIC_BR = b'\x21\x12\xa4\x42'
             import struct as _st_br, select as _sel_br, time as _time_br
             _br_prefer_direct_stun = {_audio_sock: False, _video_sock: False}
@@ -6269,6 +6269,19 @@ class DeviceClient(object):
                                 and _bpkt[4:8] == _STUN_MAGIC_BR
                                 and _bpkt[:2] == b'\x00\x01'):
                             # STUN Binding Request — send Binding Success Response
+                            if not _br_first_req_dumped:
+                                _br_first_req_dumped = True
+                                _attrs = []
+                                _o = 20
+                                while _o + 4 <= len(_bpkt):
+                                    _at, _al = _st_br.unpack_from('!HH', _bpkt, _o)
+                                    _attrs.append(f"0x{_at:04x}/{_al}")
+                                    _o += 4 + _al + (-_al % 4)
+                                _status(
+                                    f"bridge: first BindingReq from"
+                                    f" {_bsrc[0]}:{_bsrc[1]}"
+                                    f" attrs=[{', '.join(_attrs)}]"
+                                )
                             try:
                                 if _br_turn_peer_ip is None and _bsrc[0] != _hp_host:
                                     _br_prefer_direct_stun[_bs] = True
@@ -6385,6 +6398,7 @@ class DeviceClient(object):
 
         _br_first_di_logged = False
         _br_first_srtp_logged = False
+        _br_first_req_dumped = False
 
         _bridge_thread = _threading_br.Thread(
             target=_bridge_fn, daemon=True, name="sdes-bridge"
