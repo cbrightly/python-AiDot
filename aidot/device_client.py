@@ -6207,6 +6207,7 @@ class DeviceClient(object):
 
         def _bridge_fn():
             nonlocal _br_first_di_logged, _br_first_srtp_logged, _br_first_req_dumped
+            nonlocal _br_first_audio_logged, _br_first_video_logged
             _STUN_MAGIC_BR = b'\x21\x12\xa4\x42'
             import struct as _st_br, select as _sel_br, time as _time_br
             _br_prefer_direct_stun = {_audio_sock: False, _video_sock: False}
@@ -6352,20 +6353,62 @@ class DeviceClient(object):
                         elif len(_bpkt) >= 20 and _bpkt[4:8] == _STUN_MAGIC_BR:
                             pass  # other STUN (keepalives etc.) — ignore
                         else:
-                            # Non-STUN packet — forward SRTP to ffmpeg loopback port
-                            _btgt = (
-                                _lo_audio_port if _bs is _audio_sock
-                                else _lo_video_port
-                            )
+                            # Non-STUN packet — demux SRTP/SRTCP by RTP payload type.
+                            # Camera answers BUNDLE (a=group:BUNDLE 0 1) so all media
+                            # arrives on _audio_sock.  Routing by source socket would
+                            # send video RTP to ffmpeg's audio loopback.  RFC 5761:
+                            #   - RTP byte[1] = M(1) | PT(7); PT in 0..127
+                            #   - RTCP byte[1] = PT(8); PT in 200..204
+                            # SRTP/SRTCP keeps the header in clear, so we can read PT
+                            # before decryption.  Audio PTs: 0 (PCMU), 8 (PCMA).
+                            # Video PTs: 96 (H264), 97 (H265).
+                            _pt_byte = _bpkt[1] if len(_bpkt) > 1 else 0
+                            if 200 <= _pt_byte <= 204:
+                                # SRTCP — duplicate to both loopbacks since each
+                                # ffmpeg m-section was offered with rtcp-mux.
+                                try:
+                                    _lo_a.sendto(_bpkt, ('127.0.0.1', _lo_audio_port))
+                                except Exception:
+                                    pass
+                                try:
+                                    _lo_v.sendto(_bpkt, ('127.0.0.1', _lo_video_port))
+                                except Exception:
+                                    pass
+                                continue
+                            _pt = _pt_byte & 0x7F
+                            if _pt in (96, 97):
+                                _btgt, _lo_target, _kind = (
+                                    _lo_video_port, _lo_v, "video"
+                                )
+                            elif _pt in (0, 8):
+                                _btgt, _lo_target, _kind = (
+                                    _lo_audio_port, _lo_a, "audio"
+                                )
+                            else:
+                                # Unknown PT — fall back to source-socket routing.
+                                if _bs is _audio_sock:
+                                    _btgt, _lo_target, _kind = (
+                                        _lo_audio_port, _lo_a, "audio"
+                                    )
+                                else:
+                                    _btgt, _lo_target, _kind = (
+                                        _lo_video_port, _lo_v, "video"
+                                    )
                             if not _br_first_srtp_logged:
                                 _br_first_srtp_logged = True
                                 _status(
                                     f"bridge: first SRTP from"
-                                    f" {_bsrc[0]}:{_bsrc[1]}"
-                                    f" → loopback:{_btgt}"
+                                    f" {_bsrc[0]}:{_bsrc[1]} pt={_pt}"
+                                    f" → {_kind} loopback:{_btgt}"
                                 )
+                            if _kind == "audio" and not _br_first_audio_logged:
+                                _br_first_audio_logged = True
+                                _status(f"bridge: first audio RTP pt={_pt}")
+                            elif _kind == "video" and not _br_first_video_logged:
+                                _br_first_video_logged = True
+                                _status(f"bridge: first video RTP pt={_pt}")
                             try:
-                                (_lo_a if _bs is _audio_sock else _lo_v).sendto(
+                                _lo_target.sendto(
                                     _bpkt, ('127.0.0.1', _btgt)
                                 )
                             except Exception:
@@ -6399,6 +6442,8 @@ class DeviceClient(object):
         _br_first_di_logged = False
         _br_first_srtp_logged = False
         _br_first_req_dumped = False
+        _br_first_audio_logged = False
+        _br_first_video_logged = False
 
         _bridge_thread = _threading_br.Thread(
             target=_bridge_fn, daemon=True, name="sdes-bridge"
