@@ -4778,13 +4778,43 @@ class DeviceClient(object):
                         except Exception:
                             pass
 
-                    for _np_tc in pc.getTransceivers():
-                        _np_tc.receiver.transport._validate_peer_identity = (
-                            _np_types.MethodType(
-                                _np_accept_cam_cert,
-                                _np_tc.receiver.transport,
-                            )
+                    # Diag: log PC/ICE state at patch-application time so we
+                    # can see whether DTLS handshake has *already* started by
+                    # the time we install the bypass (some aiortc versions
+                    # kick off DTLS during setRemoteDescription itself).
+                    _status(
+                        "fingerprint bypass: pre-patch"
+                        f" pc.connectionState={pc.connectionState}"
+                        f" pc.iceConnectionState={pc.iceConnectionState}"
+                    )
+                    for _np_idx, _np_tc in enumerate(pc.getTransceivers()):
+                        _np_dtls = _np_tc.receiver.transport
+                        _np_ice = _np_dtls.transport
+                        _np_pre_vpi = getattr(
+                            getattr(
+                                _np_dtls, "_validate_peer_identity", None
+                            ),
+                            "__qualname__",
+                            "missing",
                         )
+                        _status(
+                            f"  patch[{_np_idx}] id(dtls)={id(_np_dtls)}"
+                            f" id(ice)={id(_np_ice)}"
+                            f" dtls.state={getattr(_np_dtls, 'state', '?')}"
+                            f" ice.state={getattr(_np_ice, 'state', '?')}"
+                            f" pre.vpi={_np_pre_vpi}"
+                        )
+                        _np_dtls._validate_peer_identity = (
+                            _np_types.MethodType(_np_accept_cam_cert, _np_dtls)
+                        )
+                        _np_post_vpi = getattr(
+                            getattr(
+                                _np_dtls, "_validate_peer_identity", None
+                            ),
+                            "__qualname__",
+                            "missing",
+                        )
+                        _status(f"  patch[{_np_idx}] post.vpi={_np_post_vpi}")
                     _status(
                         "fingerprint bypass applied"
                         f" ({len(pc.getTransceivers())} transceivers)"
@@ -4799,6 +4829,33 @@ class DeviceClient(object):
                         type=answer.get("type", "answer"),
                     )
                 )
+                # Diag: per-transceiver DTLS/ICE state immediately after
+                # setRemoteDescription returns.  If dtls.state already !=
+                # "new" here, aiortc has kicked off DTLS handshake on the
+                # setRemoteDescription call itself — meaning our patch
+                # (applied above) ran before, but any handshake that
+                # already failed earlier wouldn't show that here either.
+                try:
+                    for _srd_idx, _srd_tc in enumerate(
+                        pc.getTransceivers()
+                    ):
+                        _srd_dtls = _srd_tc.receiver.transport
+                        _srd_ice = _srd_dtls.transport
+                        _srd_vpi = getattr(
+                            getattr(
+                                _srd_dtls, "_validate_peer_identity", None
+                            ),
+                            "__qualname__",
+                            "missing",
+                        )
+                        _status(
+                            f"  post-SRD[{_srd_idx}]"
+                            f" dtls.state={getattr(_srd_dtls, 'state', '?')}"
+                            f" ice.state={getattr(_srd_ice, 'state', '?')}"
+                            f" vpi={_srd_vpi}"
+                        )
+                except Exception as _srd_diag_exc:
+                    _status(f"  post-SRD diag failed: {_srd_diag_exc}")
             except Exception as exc:
                 # Dump full SDP and traceback so we can pinpoint where aiortc
                 # is choking (the {exc} message alone — e.g. "not enough
