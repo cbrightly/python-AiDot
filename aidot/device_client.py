@@ -6396,10 +6396,27 @@ class DeviceClient(object):
                                     )
                             if not _br_first_srtp_logged:
                                 _br_first_srtp_logged = True
+                                # Hex-dump first 24 bytes + parsed RTP header
+                                # so we can verify byte 0 is 0x80 (real RTP v2),
+                                # PT, sequence, timestamp, and SSRC against the
+                                # camera's announced ssrc:5075/5073.
+                                _hex24 = _bpkt[:24].hex()
+                                _b0 = _bpkt[0] if len(_bpkt) > 0 else 0
+                                if len(_bpkt) >= 12:
+                                    _seq16, _ts32, _ssrc32 = _st_br.unpack_from(
+                                        '!HII', _bpkt, 2
+                                    )
+                                else:
+                                    _seq16 = _ts32 = _ssrc32 = 0
                                 _status(
                                     f"bridge: first SRTP from"
                                     f" {_bsrc[0]}:{_bsrc[1]} pt={_pt}"
                                     f" → {_kind} loopback:{_btgt}"
+                                    f"  byte0=0x{_b0:02x} byte1=0x{_pt_byte:02x}"
+                                    f" seq={_seq16} ts={_ts32}"
+                                    f" ssrc={_ssrc32}"
+                                    f" len={len(_bpkt)}"
+                                    f" hex24={_hex24}"
                                 )
                             if _kind == "audio" and not _br_first_audio_logged:
                                 _br_first_audio_logged = True
