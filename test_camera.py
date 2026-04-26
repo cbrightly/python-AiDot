@@ -665,8 +665,8 @@ def main() -> None:
                         help="Record the stream to this file (e.g. /tmp/cam.ts). "
                              "Use .ts for live viewing (ffplay/VLC) or RTSP re-broadcast "
                              "via ffmpeg+MediaMTX / go2rtc. SDES cameras use ffmpeg directly.")
-    parser.add_argument("--webrtc-seconds", type=int, default=30,
-                        help="How many seconds to stream during --webrtc (default: 30)")
+    parser.add_argument("--webrtc-seconds", type=int, default=60,
+                        help="How many seconds to stream during --webrtc (default: 60)")
     parser.add_argument("--webrtc-timeout", type=float, default=30.0,
                         help="Seconds to wait for WebRTC ICE connection (default: 30)")
     parser.add_argument("--webrtc-sdes", action="store_true",

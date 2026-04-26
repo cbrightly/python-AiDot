@@ -3616,15 +3616,72 @@ class DeviceClient(object):
         pc = RTCPeerConnection(
             configuration=RTCConfiguration(iceServers=_ice_servers)
         )
-        # Audio: sendrecv to advertise talkback capability.  Reference
-        # webrtc-internals capture (research/webrtc_internals_dump.json:5433)
-        # of a working session uses a=sendrecv on audio (with no actual
-        # audio track sent — sender stays silent).  Our previous a=recvonly
-        # appears to leave the camera waiting for talkback advertisement
-        # before it opens the encoder; camera tears down ~20s after SCTP
-        # up with no RTP ever produced.  Video stays recvonly (matches ref).
-        pc.addTransceiver("audio", direction="sendrecv")   # mid:0  audio (sendrecv for talkback advert)
-        pc.addTransceiver("video", direction="recvonly")   # mid:1  video (H264; H265 injected below)
+        # Audio: sendrecv with an actual silent-audio sender.  Two reasons:
+        #
+        # 1. The reference webrtc-internals capture
+        #    (research/webrtc_internals_dump.json:5433) shows working WebRTC
+        #    clients advertise audio sendrecv (talkback capability).  Switching
+        #    from recvonly to sendrecv (commit aa341a1b) flipped the camera
+        #    from "abandon viewer at ~22s" to patient-wait — confirmed by the
+        #    aiortc DTLS log strings ("shutdown complete" instead of "shutdown
+        #    by remote party"; rtcdtlstransport.py:565 vs :657).
+        #
+        # 2. Sendrecv alone closed the first watchdog but not the RTP gate.
+        #    Hypothesis: KVS firmware on A000088 may gate "start sending video"
+        #    on "saw at least one viewer audio RTP packet" as a liveness signal,
+        #    even when the camera answers a=sendonly for audio (i.e. it doesn't
+        #    actually want talkback, it just wants to confirm we're alive on
+        #    the SRTP path).  Attaching a real silent-audio track makes aiortc
+        #    actually emit RTP from our side.  If video starts flowing after
+        #    this, the second gate is identified.
+        #
+        # Video stays recvonly (matches reference offer in webrtc-internals dump).
+        _audio_tx = pc.addTransceiver("audio", direction="sendrecv")   # mid:0
+        pc.addTransceiver("video", direction="recvonly")               # mid:1
+        try:
+            import fractions as _fractions_mod
+            import av as _av_mod
+            from aiortc import MediaStreamTrack as _MediaStreamTrack
+
+            class _SilentPCMATrack(_MediaStreamTrack):
+                """Silent 8kHz mono PCMA audio source.
+
+                Emits 20ms frames of zeros (which encodes to PCMA silence,
+                value 0xD5 / 213 per ITU-T G.711 a-law for amplitude 0).
+                The camera negotiates PT=8 (PCMA/8000) for audio so this
+                matches.  We don't actually need talkback to work — the goal
+                is to put SOMETHING on the audio SSRC so the camera sees
+                viewer-side RTP and (hypothetically) opens its encoder.
+                """
+                kind = "audio"
+
+                def __init__(self) -> None:
+                    super().__init__()
+                    self._timestamp = 0
+                    self._samples_per_frame = 160  # 20ms @ 8kHz
+                    self._sample_rate = 8000
+                    self._time_base = _fractions_mod.Fraction(1, self._sample_rate)
+
+                async def recv(self):
+                    import asyncio as _asyncio_mod
+                    # Pace at 20ms intervals
+                    await _asyncio_mod.sleep(self._samples_per_frame / self._sample_rate)
+                    frame = _av_mod.AudioFrame(
+                        format="s16", layout="mono", samples=self._samples_per_frame
+                    )
+                    frame.sample_rate = self._sample_rate
+                    frame.time_base = self._time_base
+                    frame.pts = self._timestamp
+                    self._timestamp += self._samples_per_frame
+                    # planes[0] is already zeroed by default (np.zeros equivalent)
+                    return frame
+
+            _silent_track = _SilentPCMATrack()
+            _audio_tx.sender.replaceTrack(_silent_track)
+            _status("audio: attached silent PCMA sender (RTP liveness probe)")
+        except Exception as _silent_exc:
+            _status(f"audio: silent-sender attach failed: {_silent_exc}"
+                    " — falling back to silent-no-track (a=sendrecv with empty sender)")
         # SCTP data channel — KVS firmware ALWAYS opens SCTP regardless of
         # whether m=application is in the negotiated answer.  Decoded the
         # post-handshake 0x17 records as SCTP INIT chunks (srcPort=5000
@@ -4758,6 +4815,23 @@ class DeviceClient(object):
                 f"  m=audio={_sdp_transport(_ans_sdp, 'audio')}"
             )
             _status("Answer m-sections (%d): %s" % (len(_ans_mlines), " | ".join(_ans_mlines)))
+            # Log negotiated direction per m-section so we can see whether
+            # camera renegotiated audio sendrecv→sendonly (or kept sendrecv).
+            # Also expose ssrc/msid lines — useful when diagnosing why media
+            # doesn't flow even though signaling completes.
+            try:
+                _ans_dirs = []
+                _cur_mid = None
+                for _ln in _ans_sdp.splitlines():
+                    if _ln.startswith("m="):
+                        _cur_mid = _ln.split()[0][2:]  # "audio", "video", "application"
+                    elif _ln.startswith("a=mid:"):
+                        _cur_mid = f"{_cur_mid}/mid={_ln[6:]}"
+                    elif _ln in ("a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"):
+                        _ans_dirs.append(f"{_cur_mid}={_ln[2:]}")
+                _status(f"Answer m-section directions: {_ans_dirs}")
+            except Exception as _ans_dir_exc:
+                _status(f"Answer m-section direction log failed: {_ans_dir_exc}")
 
             # ---- Fingerprint placeholder + bypass -------------------------------- #
             # A001064 (and family) returns answer SDP with empty
