@@ -3616,72 +3616,34 @@ class DeviceClient(object):
         pc = RTCPeerConnection(
             configuration=RTCConfiguration(iceServers=_ice_servers)
         )
-        # Audio: sendrecv with an actual silent-audio sender.  Two reasons:
+        # Audio: sendrecv WITHOUT a real audio sender.  Empirical findings
+        # from 2026-04-26 testing (commits aa341a1b, aeaea893):
         #
-        # 1. The reference webrtc-internals capture
-        #    (research/webrtc_internals_dump.json:5433) shows working WebRTC
-        #    clients advertise audio sendrecv (talkback capability).  Switching
-        #    from recvonly to sendrecv (commit aa341a1b) flipped the camera
-        #    from "abandon viewer at ~22s" to patient-wait — confirmed by the
-        #    aiortc DTLS log strings ("shutdown complete" instead of "shutdown
-        #    by remote party"; rtcdtlstransport.py:565 vs :657).
+        #   recvonly             → camera tears down at ~22s after SCTP up
+        #                          (REMOTE-initiated DTLS Alert)
+        #   sendrecv, no track   → camera patient-waits indefinitely
+        #                          (no remote tear-down within test window)
+        #   sendrecv + silent
+        #     PCMA RTP track     → camera tears down at ~24s after SCTP up
+        #                          (REMOTE-initiated DTLS Alert)
         #
-        # 2. Sendrecv alone closed the first watchdog but not the RTP gate.
-        #    Hypothesis: KVS firmware on A000088 may gate "start sending video"
-        #    on "saw at least one viewer audio RTP packet" as a liveness signal,
-        #    even when the camera answers a=sendonly for audio (i.e. it doesn't
-        #    actually want talkback, it just wants to confirm we're alive on
-        #    the SRTP path).  Attaching a real silent-audio track makes aiortc
-        #    actually emit RTP from our side.  If video starts flowing after
-        #    this, the second gate is identified.
+        # Sendrecv flips a "viewer is a real client" gate in the camera's
+        # KVS-WebRTC firmware (verified against reference offer in
+        # research/webrtc_internals_dump.json:5433 which also uses sendrecv).
+        # But actually emitting audio RTP from our side regresses the
+        # camera — the firmware appears to dislike receiving viewer audio
+        # in some way (possibly: codec mismatch, SSRC routing bug, or
+        # firmware bug processing inbound audio).  Camera answer keeps
+        # sendrecv on its mid:0 audio (line 327 of test log) so it's not
+        # a direction-mismatch issue at the SDP layer.
         #
-        # Video stays recvonly (matches reference offer in webrtc-internals dump).
-        _audio_tx = pc.addTransceiver("audio", direction="sendrecv")   # mid:0
-        pc.addTransceiver("video", direction="recvonly")               # mid:1
-        try:
-            import fractions as _fractions_mod
-            import av as _av_mod
-            from aiortc import MediaStreamTrack as _MediaStreamTrack
-
-            class _SilentPCMATrack(_MediaStreamTrack):
-                """Silent 8kHz mono PCMA audio source.
-
-                Emits 20ms frames of zeros (which encodes to PCMA silence,
-                value 0xD5 / 213 per ITU-T G.711 a-law for amplitude 0).
-                The camera negotiates PT=8 (PCMA/8000) for audio so this
-                matches.  We don't actually need talkback to work — the goal
-                is to put SOMETHING on the audio SSRC so the camera sees
-                viewer-side RTP and (hypothetically) opens its encoder.
-                """
-                kind = "audio"
-
-                def __init__(self) -> None:
-                    super().__init__()
-                    self._timestamp = 0
-                    self._samples_per_frame = 160  # 20ms @ 8kHz
-                    self._sample_rate = 8000
-                    self._time_base = _fractions_mod.Fraction(1, self._sample_rate)
-
-                async def recv(self):
-                    import asyncio as _asyncio_mod
-                    # Pace at 20ms intervals
-                    await _asyncio_mod.sleep(self._samples_per_frame / self._sample_rate)
-                    frame = _av_mod.AudioFrame(
-                        format="s16", layout="mono", samples=self._samples_per_frame
-                    )
-                    frame.sample_rate = self._sample_rate
-                    frame.time_base = self._time_base
-                    frame.pts = self._timestamp
-                    self._timestamp += self._samples_per_frame
-                    # planes[0] is already zeroed by default (np.zeros equivalent)
-                    return frame
-
-            _silent_track = _SilentPCMATrack()
-            _audio_tx.sender.replaceTrack(_silent_track)
-            _status("audio: attached silent PCMA sender (RTP liveness probe)")
-        except Exception as _silent_exc:
-            _status(f"audio: silent-sender attach failed: {_silent_exc}"
-                    " — falling back to silent-no-track (a=sendrecv with empty sender)")
+        # Don't attach a sender track.  The patient-wait state is the
+        # best-known config for this codebase.  Video still doesn't flow
+        # in patient-wait — diagnosing that requires a wire capture of an
+        # official Aidot app session ([P1.2.c]); further SDP-attribute
+        # guessing has not been productive.
+        pc.addTransceiver("audio", direction="sendrecv")   # mid:0  (sendrecv advert; no sender track)
+        pc.addTransceiver("video", direction="recvonly")   # mid:1  video (H264; H265 injected below)
         # SCTP data channel — KVS firmware ALWAYS opens SCTP regardless of
         # whether m=application is in the negotiated answer.  Decoded the
         # post-handshake 0x17 records as SCTP INIT chunks (srcPort=5000
