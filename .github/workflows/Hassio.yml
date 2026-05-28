@@ -1,2 +1,2 @@
 - name: setup-homeassistant
-  uses: cbrightly/setup-homeassistant
+  uses: ludeeus/setup-homeassistant@21.11.0
