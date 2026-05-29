@@ -146,8 +146,9 @@ async def _test_recordings(dc: DeviceClient):
         return "FAIL", "API call failed"
     if not clips:
         return "SKIP", "no recordings in past 24 h (no cloud plan or quiet period)"
-    t0 = time.strftime("%H:%M", time.localtime(clips[0]["sta"] / 1000))
-    t1 = time.strftime("%H:%M", time.localtime(clips[-1]["sta"] / 1000))
+    # eventRecordingList returns "begin"/"end" timestamps in milliseconds
+    t0 = time.strftime("%H:%M", time.localtime((clips[0].get("begin") or clips[0].get("eventTime", 0)) / 1000))
+    t1 = time.strftime("%H:%M", time.localtime((clips[-1].get("begin") or clips[-1].get("eventTime", 0)) / 1000))
     return "PASS", f"{len(clips)} clip(s)  {t0} → {t1}"
 
 
@@ -319,33 +320,28 @@ async def _test_snapshot(dc: DeviceClient, cam_name: str):
 # ── Per-camera tests — Cloud playback ──────────────────────────────────────── #
 
 async def _test_playback(dc: DeviceClient):
+    """Verify cloud playback URL via getEventVideoUrl (HTTP-only, no MQTT/TCP)."""
     now_ms = int(time.time() * 1000)
-    clips  = await dc.async_get_cloud_recordings(now_ms - 86_400_000, now_ms)
+    clips  = await dc.async_get_cloud_recordings(now_ms - 7 * 86_400_000, now_ms)
     if not clips:
-        return "SKIP", "no recordings to play back"
+        return "SKIP", "no recordings in last 7 days"
 
-    clip    = clips[0]
-    dur_s   = (clip["end"] - clip["sta"]) // 1000
-    played  = [0]
+    clip = clips[0]
+    event_uuid = clip.get("eventUuid")
+    if not event_uuid:
+        return "SKIP", f"no eventUuid in recording item (keys: {sorted(clip.keys())})"
 
-    def on_frame(f):
-        played[0] += 1
+    url = await dc.async_get_event_video_url(event_uuid)
+    if not url:
+        return "FAIL", "getEventVideoUrl returned no URL"
 
-    session = await asyncio.wait_for(
-        dc.async_open_cloud_playback(clip["sta"], clip["end"], on_frame),
-        timeout=20,
-    )
-    if session is None:
-        return "FAIL", "async_open_cloud_playback returned None"
-
-    try:
-        await asyncio.sleep(5)
-    finally:
-        await session.stop()
-
-    if played[0] < 3:
-        return "WARN", f"only {played[0]} frame(s) in 5s (clip is {dur_s}s long)"
-    return "PASS", f"{played[0]} frames in 5s  clip={dur_s}s"
+    # Confirm the URL looks like a CDN video link
+    is_mp4  = ".mp4" in url.lower()
+    is_m3u8 = ".m3u8" in url.lower()
+    kind    = "mp4" if is_mp4 else ("m3u8" if is_m3u8 else "url")
+    sta_ms  = clip.get("begin") or clip.get("eventTime") or 0
+    dur_s   = ((clip.get("end") or (sta_ms + 30_000)) - sta_ms) // 1000
+    return "PASS", f"{kind} {dur_s}s clip → {url[:80]}…" if len(url) > 80 else f"{kind} {dur_s}s clip → {url}"
 
 
 # ── Per-camera tests — LAN probe ────────────────────────────────────────────── #

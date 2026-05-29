@@ -50,6 +50,10 @@ _LOGGER = logging.getLogger(__name__)
 # AppKey from LDSAppOpenSDK CocoaPods docs (kLDSAppOpenSDKKey = "appa070")
 _LEEDARSON_APP_KEY = "appa070"
 
+# APP_ID sent in smarthome HTTP headers — value from MainActivity.java SharedPrefs
+# (SharePreferenceUtils.setPrefString(this, "APP_ID", "1392315867093508098")).
+_LEEDARSON_APP_ID = "1392315867093508098"
+
 # Camera-specific backend; region prefix mirrors AidotClient._base_url pattern.
 # e.g. "us" -> "https://us-smarthome.arnoo.com:443"
 _SMARTHOME_URL_TEMPLATE = "https://{region}-smarthome.arnoo.com:443"
@@ -1842,23 +1846,20 @@ class DeviceClient(object):
         return _SMARTHOME_URL_TEMPLATE.format(region=self._region)
 
     def _leedarson_headers(self) -> dict:
-        # Headers confirmed from requests/g.java: owner, token, terminal auto-injected.
-        # The "owner" field is the numeric userId string — required for data to be returned.
+        # Headers from OkHttp interceptor (b.java): token, appId, terminal auto-injected.
+        # NOTE: "owner" is intentionally omitted — the recording/playback endpoints
+        # return 560073 "Share head error" when owner is present; token alone identifies
+        # the user on us-smarthome.arnoo.com.  Add owner only if a specific endpoint
+        # requires it (none currently do).
         token = (
             self._user_info.get("accessToken")
             or self._user_info.get("access_token")
             or ""
         )
-        # owner = numeric userId: use smarthome auth if already populated, else AiDot id
-        owner = str(
-            (self._smarthome_auth or {}).get("userId")
-            or self.user_id
-            or ""
-        )
         return {
             "terminal":        "app",
             "token":           token,
-            "owner":           owner,
+            "appId":           _LEEDARSON_APP_ID,
             "active-language": "en_US",
             "Content-Type":    "application/json",
         }
@@ -2141,7 +2142,8 @@ class DeviceClient(object):
 
             # Find the entry for this device
             if isinstance(data, dict):
-                return data.get(self.device_id) or next(iter(data.values()), None)
+                item = data.get(self.device_id) or next(iter(data.values()), None)
+                return item
             if isinstance(data, list):
                 for item in data:
                     # Server may use "deviceId", "devId", or "id" as the device
@@ -2617,13 +2619,14 @@ class DeviceClient(object):
         start_ts: int,
         end_ts: int,
         *,
-        page: int = 0,
+        page: int = 1,
         page_size: int = 10,
     ) -> List[dict]:
         """List cloud-recorded event clips for this camera.
 
         start_ts / end_ts: Unix timestamps in milliseconds.
-        Returns list of dicts from the server (each has eventId, eventOddurTime, url, etc.).
+        page: 1-indexed page number (the server uses 1-based pagination).
+        Returns list of dicts from the server (each has eventUuid, eventDesc, picUrl, etc.).
 
         Uses /api/ipc/playback/eventRecordingList (confirmed from EventListRepos.java).
         Body format from EventListRequestParamsBean: deviceIds (list), recordSta, recordEnd,
@@ -2631,7 +2634,6 @@ class DeviceClient(object):
         """
         import aiohttp
 
-        await self._async_get_smarthome_auth()  # ensure numeric userId in owner header
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -2672,70 +2674,92 @@ class DeviceClient(object):
             )
             return []
 
-    async def async_get_latest_thumbnail(self) -> Optional[str]:
-        """Return the URL of the most recent event/motion thumbnail for this camera.
+    async def async_get_event_video_url(self, event_uuid: str) -> Optional[str]:
+        """Return a direct playback URL (MP4 or M3U8) for a specific recording.
 
-        Two-step call matching app-beautified.js behaviour:
-          1. POST {smarthome}/videoController/getPlanType?deviceId={id}  → planId
-          2. POST {smarthome}/videoController/getEventPhotoList           → url
+        event_uuid: the eventUuid field from an async_get_cloud_recordings() item.
+        Returns the first video URL from getEventVideoUrl, or None on error.
 
-        Returns the CDN URL string, or None if no events exist or the camera
-        has no cloud storage plan.
+        From CloudPlaybackFragment.java / EventListRepos.java:
+          POST /api/ipc/playback/getEventVideoUrl
+          body: {deviceId, eventList: [{eventUuid}]}
+          response: data.eventUrlList[0].videoUrlList[0].url
+          type 1 = MP4, type 2 = M3U8
         """
         import aiohttp
 
-        await self._async_get_smarthome_auth()  # ensure numeric userId in owner header
-        base = self._smarthome_base
-
-        # Step 1 — fetch the planId for this device.
-        # app-beautified.js line 2923: getPlanType is a POST to ?deviceId=X (no body).
-        plan_id: Optional[str] = None
-        _plan_raw: Any = None
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"{base}/videoController/getPlanType?deviceId={self.device_id}",
-                    headers=self._leedarson_headers(),
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    _plan_raw = await resp.json(content_type=None)
-            _LOGGER.debug("getPlanType raw for %s: %s", self.device_id, _plan_raw)
-            data = (_plan_raw or {}).get("data") or {}
-            plan_id = data.get("planId")
-        except Exception as exc:
-            _LOGGER.debug("getPlanType failed for %s: %s", self.device_id, exc)
-
-        if not plan_id:
-            _LOGGER.warning(
-                "async_get_latest_thumbnail: no planId for %s "
-                "(camera likely has no cloud subscription); raw=%s",
-                self.device_id, _plan_raw,
-            )
-            return None
-
-        # Step 2 — fetch the most recent event photo
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{base}/videoController/getEventPhotoList",
+                    f"{self._smarthome_base}/api/ipc/playback/getEventVideoUrl",
                     json={
-                        "planId":         plan_id,
-                        "pageNum":        1,
-                        "pageSize":       1,
-                        "eventCode":      "12",   # motion/event code
-                        "eventStartTime": "",
-                        "eventEndTime":   "",
+                        "deviceId":  self.device_id,
+                        "eventList": [{"eventUuid": event_uuid}],
                     },
                     headers=self._leedarson_headers(),
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     body = await resp.json(content_type=None)
 
-            _LOGGER.debug("getEventPhotoList raw for %s: %s", self.device_id, body)
             if body.get("code") != 200:
                 _LOGGER.warning(
-                    "getEventPhotoList code=%s msg=%s for %s",
-                    body.get("code"), body.get("desc") or body.get("msg"), self.device_id,
+                    "getEventVideoUrl code=%s for %s uuid=%s: %s",
+                    body.get("code"), self.device_id, event_uuid, body,
+                )
+                return None
+
+            event_url_list = ((body.get("data") or {}).get("eventUrlList") or [])
+            if not event_url_list:
+                return None
+            video_url_list = (event_url_list[0] or {}).get("videoUrlList") or []
+            if not video_url_list:
+                return None
+            return video_url_list[0].get("url") or None
+
+        except Exception as exc:
+            _LOGGER.error(
+                "async_get_event_video_url failed for %s uuid=%s: %s",
+                self.device_id, event_uuid, exc,
+            )
+            return None
+
+    async def async_get_latest_thumbnail(self) -> Optional[str]:
+        """Return the URL of the most recent event/motion thumbnail for this camera.
+
+        Uses /api/ipc/playback/eventRecordingList (pageNum=1, pageSize=1) and extracts
+        the picUrl CDN field from the first result.  This endpoint works without an
+        "owner" header (unlike the videoController paths which return 560073 with owner).
+
+        Returns the CDN URL string, or None if no events exist.
+        """
+        import aiohttp, time
+
+        end_ts = int(time.time() * 1000)
+        start_ts = end_ts - 30 * 86_400_000  # look back 30 days
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self._smarthome_base}/api/ipc/playback/eventRecordingList",
+                    json={
+                        "deviceIds":  [self.device_id],
+                        "eventCodes": [],
+                        "areaIds":    [],
+                        "pageNum":    1,
+                        "pageSize":   1,
+                        "recordSta":  start_ts,
+                        "recordEnd":  end_ts,
+                    },
+                    headers=self._leedarson_headers(),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    body = await resp.json(content_type=None)
+
+            _LOGGER.debug("thumbnail eventRecordingList for %s: %s", self.device_id, body)
+            if body.get("code") != 200:
+                _LOGGER.debug(
+                    "async_get_latest_thumbnail: code=%s for %s (no cloud plan or no events)",
+                    body.get("code"), self.device_id,
                 )
                 return None
 
@@ -2744,7 +2768,7 @@ class DeviceClient(object):
                 _LOGGER.debug("No event photos available for %s", self.device_id)
                 return None
 
-            url = items[0].get("url")
+            url = items[0].get("picUrl")
             _LOGGER.debug("Latest thumbnail for %s: %s", self.device_id, url)
             return url or None
 
@@ -2953,7 +2977,9 @@ class DeviceClient(object):
 
     async def _sdes_keepalive_loop(self) -> None:
         """Background task: keep SDES stream alive; push to go2rtc via RTSP."""
-        _RETRY_DELAY = 10.0
+        _MIN_DELAY = 10.0
+        _MAX_DELAY = 300.0
+        _retry_delay = _MIN_DELAY
 
         while self._streaming_active:
             try:
@@ -2966,14 +2992,16 @@ class DeviceClient(object):
             except Exception as exc:
                 _LOGGER.warning(
                     "SDES keepalive: stream open failed for %s (retry in %.0fs): %s",
-                    self.device_id, _RETRY_DELAY, exc,
+                    self.device_id, _retry_delay, exc,
                 )
                 try:
-                    await asyncio.sleep(_RETRY_DELAY)
+                    await asyncio.sleep(_retry_delay)
                 except asyncio.CancelledError:
                     return
+                _retry_delay = min(_retry_delay * 2, _MAX_DELAY)
                 continue
 
+            _retry_delay = _MIN_DELAY  # reset on success
             self._stream_session = session
             try:
                 await session.wait_done()
@@ -2991,7 +3019,7 @@ class DeviceClient(object):
 
             if self._streaming_active:
                 try:
-                    await asyncio.sleep(_RETRY_DELAY)
+                    await asyncio.sleep(_MIN_DELAY)
                 except asyncio.CancelledError:
                     return
 
@@ -3000,7 +3028,9 @@ class DeviceClient(object):
         import io as _io
 
         _WATCHDOG = 30.0
-        _RETRY_DELAY = 5.0
+        _MIN_DELAY = 5.0
+        _MAX_DELAY = 300.0
+        _retry_delay = _MIN_DELAY
 
         def _on_frame(frame) -> None:
             # Accept keyframes always; accept P-frames only after first keyframe.
@@ -3030,14 +3060,16 @@ class DeviceClient(object):
             except Exception as exc:
                 _LOGGER.warning(
                     "Stream open failed for %s (retry in %.0fs): %s",
-                    self.device_id, _RETRY_DELAY, exc,
+                    self.device_id, _retry_delay, exc,
                 )
                 try:
-                    await asyncio.sleep(_RETRY_DELAY)
+                    await asyncio.sleep(_retry_delay)
                 except asyncio.CancelledError:
                     return
+                _retry_delay = min(_retry_delay * 2, _MAX_DELAY)
                 continue
 
+            _retry_delay = _MIN_DELAY  # reset on success
             self._stream_session = session
             try:
                 while self._streaming_active:
@@ -3063,7 +3095,7 @@ class DeviceClient(object):
 
             if self._streaming_active:
                 try:
-                    await asyncio.sleep(_RETRY_DELAY)
+                    await asyncio.sleep(_MIN_DELAY)
                 except asyncio.CancelledError:
                     return
 
