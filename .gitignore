@@ -159,4 +159,24 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-test_camera.py
+# macOS artifacts
+.DS_Store
+**/.DS_Store
+
+# Development environment
+__INIT_VENV__
+venv/
+.venv/
+
+# Test captures and scratch files
+*.pcap
+a.txt
+camera_tests/
+camera_stream.*
+camera_traffic.*
+
+# Development utility scripts (local only)
+copy_to_macbook.sh
+extract.sh
+test-*.sh
+camera_test_runner.sh

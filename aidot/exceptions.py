@@ -1,37 +1,37 @@
-"""aidot Exceptions."""
+"""AiDot exception hierarchy."""
 
 
 class AidotError(Exception):
-    """Aidot api exception."""
+    """Base exception for all AiDot errors."""
 
 
 class InvalidURL(AidotError):
-    """Invalid url exception."""
+    """Invalid URL."""
 
 
 class HTTPError(AidotError):
-    """Invalid host exception."""
+    """HTTP request failed."""
 
 
 class InvalidHost(AidotError):
-    """Invalid host exception."""
+    """Invalid host."""
 
 
 class AidotAuthTokenExpired(AidotError):
-    """Authentication failed because token is invalid or expired."""
+    """Auth token is invalid or expired."""
 
 
 class AidotAuthFailed(AidotError):
-    """Authentication failed"""
+    """Authentication failed."""
 
 
 class AidotNotLogin(AidotError):
-    """Aidot not login"""
+    """Client is not logged in."""
 
 
 class AidotUserOrPassIncorrect(AidotError):
-    """Authentication failed"""
+    """Username or password is incorrect."""
 
 
-class AidotOSError(Exception):
-    """Aidot exception."""
+class AidotOSError(AidotError):
+    """OS-level error from the AiDot library."""
