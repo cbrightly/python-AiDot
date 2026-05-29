@@ -1,0 +1,73 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Enter your AiDot account credentials.",
+        "data": {
+          "country_code": "Country",
+          "username": "Email address",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "description": "Re-enter your password for {username}.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email address or password.",
+      "cannot_connect": "Unable to connect to AiDot servers."
+    },
+    "abort": {
+      "already_configured": "Account already configured."
+    }
+  },
+  "entity": {
+    "button": {
+      "ptz_up": { "name": "PTZ up" },
+      "ptz_down": { "name": "PTZ down" },
+      "ptz_left": { "name": "PTZ left" },
+      "ptz_right": { "name": "PTZ right" },
+      "ptz_stop": { "name": "PTZ stop" },
+      "ptz_zoom_in": { "name": "PTZ zoom in" },
+      "ptz_zoom_out": { "name": "PTZ zoom out" }
+    },
+    "number": {
+      "motion_sensitivity": {
+        "name": "Motion sensitivity"
+      }
+    },
+    "switch": {
+      "motion_detection": {
+        "name": "Motion detection"
+      },
+      "status_led": {
+        "name": "Status LED"
+      },
+      "microphone": {
+        "name": "Microphone"
+      },
+      "floodlight": {
+        "name": "Floodlight"
+      },
+      "ptz_tracking": {
+        "name": "Auto-tracking"
+      },
+      "ir_light": {
+        "name": "IR light"
+      }
+    },
+    "select": {
+      "night_vision": {
+        "name": "Night vision",
+        "state": {
+          "auto": "Auto",
+          "on": "On",
+          "off": "Off"
+        }
+      }
+    }
+  }
+}

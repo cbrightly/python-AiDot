@@ -1,0 +1,22 @@
+{
+  "domain": "aidot",
+  "name": "AiDot",
+  "codeowners": [
+    "@s1eedz",
+    "@HongBryan"
+  ],
+  "config_flow": true,
+  "dhcp": [
+    {
+      "hostname": "aidot"
+    }
+  ],
+  "documentation": "https://github.com/AiDot-Development-Team/hass-aidot",
+  "integration_type": "hub",
+  "iot_class": "local_polling",
+  "quality_scale": "bronze",
+  "requirements": [
+    "python-aidot>=0.4.0"
+  ],
+  "version": "2.0.0"
+}

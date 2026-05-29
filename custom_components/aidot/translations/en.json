@@ -1,0 +1,56 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Enter your AiDot account credentials.",
+        "data": {
+          "country_code": "Country",
+          "username": "Email address",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "description": "Re-enter your password for {username}.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email address or password.",
+      "cannot_connect": "Unable to connect to AiDot servers."
+    },
+    "abort": {
+      "already_configured": "Account already configured."
+    }
+  },
+  "entity": {
+    "switch": {
+      "motion_detection": {
+        "name": "Motion detection"
+      },
+      "status_led": {
+        "name": "Status LED"
+      },
+      "microphone": {
+        "name": "Microphone"
+      },
+      "floodlight": {
+        "name": "Floodlight"
+      },
+      "ptz_tracking": {
+        "name": "Auto-tracking"
+      }
+    },
+    "select": {
+      "night_vision": {
+        "name": "Night vision",
+        "state": {
+          "auto": "Auto",
+          "on": "On",
+          "off": "Off"
+        }
+      }
+    }
+  }
+}
