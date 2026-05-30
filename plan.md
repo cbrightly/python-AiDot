@@ -1,193 +1,81 @@
-# Plan: Fix Camera User Info ICE Failure (LK.IPC.A001064)
+# python-AiDot — Pre-Publication Status
 
-## Problem Summary
+*Last updated: 2026-05-30  |  Branch: claude/fix-camera-user-info-eL6Pt*
 
-Camera `LK.IPC.A001064` ("Rear of Garage PTZ") fails WebRTC ICE after 30s.
-The log shows ICE going from `checking` → `closed` without ever receiving STUN
-probes from the camera or a real `webrtcResp` with camera ICE candidates.
-
-Additionally, connection setup has unnecessary sequential delays that add up to
-~10–17 s of overhead before ICE can even begin.
+This is a camera-capable fork of the lights-only upstream
+`AiDot-Development-Team/python-aidot`. **All camera functionality here is
+original** — upstream (library and HA component) has no camera code.
 
 ---
 
-## Root Cause Analysis
+## Status Summary
 
-### Confirmed observations from the log
-
-1. `batchGetDeviceUserInfo` returns keys `['deviceId', 'userId', 'userUuid']`
-2. We extract `userId` (numeric: `1348043005373399042`) but **never extract or use `userUuid`**
-3. Camera only echoes our `webrtcReq` — no real `webrtcResp` or `iceCandidateReq` arrives
-4. The echo-only path fires; synthetic ICE candidates are added at **wrong ports**:
-   - `192.168.1.217:60705` and `192.168.1.217:47324` (our aiortc ports, not camera's)
-5. ICE probes those wrong ports, gets no response, exhausts retransmissions → closed
-
-### Root cause A: missing `userUuid` MQTT subscription (fixed — commit 8b74fa7)
-
-When the camera sends its real `webrtcResp` (answer with its own SDP and ICE candidates),
-it publishes to `iot/v1/c/{camera_userUuid}/IPC/webrtcResp`.
-
-Previously we subscribed to:
-- `iot/v1/c/{app_uuid}/#`
-- `iot/v1/c/{device_id}/#`
-- `iot/v1/c/{numeric_userId}/#`
-
-If `camera_userUuid` ≠ any of those, the camera's real response was silently
-dropped — we only saw broker echoes of our own messages.
-
-### Root cause B: echo-only synthetic candidates use wrong ports (fixed — this PR)
-
-When we fall into the echo-only path, `_rr_cam_ports` is populated from the
-echo SDP (which is our own `webrtcReq`). Those ports are our aiortc-allocated
-ports (e.g. 60705, 47324), not the camera's. Injecting synthetic host
-candidates as `{camera_IP}:{our_port}` probes an address the camera never
-listens on → ICE fails for the full timeout.
-
-### Connection delay sources
-
-| Phase | Current delay | Notes |
-|---|---|---|
-| `batchGetDeviceUserInfo` HTTP | up to 10 s | Was sequential before MQTT |
-| `async_get_ice_config_http` HTTP | up to 10 s | Was sequential after user-info |
-| Camera wake (`getIceConfigReq`) | up to 17 s (12 s + 5 s retry) | Waits for camera_ready_ev |
-| `asyncio.sleep(0.5)` post-livePlayReq | 0.5 s fixed | Burns full time even on fast echo |
-| Echo secondary wait | was 6 s | Waiting for camera's real response |
-
-The two HTTP calls had no dependency on each other — parallelising them alone
-saves up to ~10 s.
+| Area | Status |
+|---|---|
+| SDES streaming (A001513 / A001064) | ✅ Complete and confirmed |
+| DTLS streaming (A000088) | ✅ Complete; reliability fixed (cert + reorder + retry) |
+| DTLS audio cutoff (~25s) | ✅ Resolved — verified audio runs full session |
+| Camera controls + PTZ | ✅ Complete |
+| Snapshots (live + SDES frame-extract) | ✅ Complete |
+| Cloud recordings + thumbnails | ✅ Complete (auth fixed) |
+| Two-way audio (talk) — DTLS path | ✅ Implemented + live-confirmed |
+| Two-way audio — SDES path | ⏳ Future (avSendAudioData + SFrameInfo) |
+| MQTT parity (APK-accurate) | ✅ Complete — getDevAttrReq removed |
+| HA custom component | ✅ Complete + reviewed; light/camera/switch/select/number/button |
+| HA manifest installable | ✅ Real deps listed; lib installed from git (README) |
+| Credential storage | ✅ Fernet-encrypted, cross-platform |
+| Security audit | ✅ Complete |
+| Validation pass (pre-review) | ⏳ In progress |
+| Code review | ⏳ Pending |
+| Git squash for publication | ⏳ Outstanding (task #49) |
 
 ---
 
-## Fixes Implemented
+## Recently resolved (this work cycle)
 
-### Fix 1 (Primary — latency): Parallelize HTTP pre-flight calls
-
-**File**: `aidot/device_client.py` — at `async_open_webrtc_stream` start
-
-`batchGetDeviceUserInfo` and `async_get_ice_config_http` are now run
-concurrently with `asyncio.gather` instead of sequentially.
-
-```python
-_fetch_http_ice = not _skip_ice_config and _ice_config is None
-if _fetch_http_ice:
-    _cam_user_info, _http_ice_config = await asyncio.gather(
-        self.async_get_device_user_info(all_device_ids=...),
-        self.async_get_ice_config_http(),
-    )
-else:
-    _cam_user_info = await self.async_get_device_user_info(...)
-    _http_ice_config = None
-```
-
-**Expected gain**: up to ~10 s on sessions where both HTTP calls take
-meaningful time (common in practice — different API servers).
-
-### Fix 2 (Latency): Replace `sleep(0.5)` with event-driven wait
-
-**File**: `aidot/device_client.py` — post-livePlayReq wait
-
-```python
-# Old: await asyncio.sleep(0.5)
-try:
-    await asyncio.wait_for(liveplay_echo_ev.wait(), timeout=0.5)
-except asyncio.TimeoutError:
-    pass
-```
-
-Proceeds immediately when the broker echoes livePlayReq; falls through
-after 0.5 s otherwise.
-
-**Expected gain**: 0–0.4 s when broker acknowledges quickly.
-
-### Fix 3 (Latency): Reduce echo secondary wait 6 s → 3 s
-
-**File**: `aidot/device_client.py` — echo-only detection block
-
-The secondary wait for the camera's real `webrtcResp` (after an echo is
-received) was 6 s. With the userUuid subscription fix in place, a real
-response arrives in <1 s if it's coming at all. 3 s is still generous.
-
-**Expected gain**: 3 s saved for true echo-only cameras.
-
-### Fix 4 (Connectivity): Guard echo-only synthetic candidate injection
-
-**File**: `aidot/device_client.py` — role-reversal path
-
-```python
-# Old:
-if _cam_local_ip and _rr_cam_ports and cam_ip_q.empty():
-    cam_ip_q.put_nowait(_cam_local_ip)
-
-# New:
-if _cam_local_ip and _rr_cam_ports and cam_ip_q.empty() and not _rr_echo_only:
-    cam_ip_q.put_nowait(_cam_local_ip)
-```
-
-For echo-only cameras, `_rr_cam_ports` contains **our** aiortc ports (from
-the echoed SDP), not the camera's. Injecting synthetic host candidates at
-`{camera_IP}:{our_port}` probes the wrong endpoint and burns the full ICE
-timeout. Instead, the echo-only path relies on:
-
-1. **Arnoo TURN relay** (already appended to `_ice_servers` when no TURN is in
-   `getIceConfigResp`) — allows the camera to reach us via relay without
-   knowing its direct IP/port.
-2. **`second_answer_fut` candidates** (processed in the ICE wait loop) — if
-   the camera sends a real `webrtcResp` after receiving our `webrtcResp`, its
-   actual ICE candidates will be applied.
-
-### Fix 5 (Diagnostics): Log echo-only skip reason
-
-When echo-only path skips the cam_ip_q pre-seed, log the ports that were
-skipped and why, so future debugging is easier.
+- **#42 DTLS reliability** — three fixes:
+  - `915e3652` old-pyOpenSSL cert incompatibility (the Pi's 100% failure) +
+    `_send_rtcp_pli` signature fix (restored video decode).
+  - `656561b1` rebuild reordered/4-section H265 camera answers.
+  - `5f1501e1` bounded connect retry (`--webrtc-retries`, default 3) for the
+    intermittent ICE port-nomination issue (camera exposes two candidate pairs;
+    aioice picks the wrong port ~50% of the time — root cause confirmed via
+    port-traffic analysis; retry re-rolls and reliably connects).
+  - Audio-cutoff verified gone: ffprobe of a 40s recording shows the audio
+    stream running the full session.
+- **#45 two-way audio (DTLS)** — `5b2d6862` PCMA sender track + SPEAKERSTART(848),
+  `--talk` CLI flag, pure-Python A-law encoder (`tools/g711_tone.py`).
+- **#48 siren + speaker_volume** HA entities.
+- **#50 manifest pin** — replaced unsatisfiable `python-aidot>=0.4.0` with real
+  third-party deps; library installed from git (documented in README).
+- **#46/#47** cloud-recording auth + speculative-auth cleanup.
 
 ---
 
-## Earlier Fixes (already committed on this branch)
+## Outstanding before publication
 
-### Fix A: Subscribe to `userUuid` MQTT topics (commit 8b74fa7)
+1. **Validation pass** (this cycle) — exercise every feature against live
+   cameras and record pass/fail.
+2. **Code review** — `/code-review` on the branch diff.
+3. **#49 Git squash** — collapse the branch into clean logical commits.
 
-Extracts `userUuid` from `batchGetDeviceUserInfo` and subscribes to
-`iot/v1/c/{userUuid}/#`, `iot/v1/cb/{userUuid}/#`, `lds/v1/c/{userUuid}/#`.
+## Future / non-blocking
 
-### Fix B: Add `wPayload.answer` to `webrtcResp` (commit 077faaf)
-
-Newer firmware (LK.IPC.A001064) parses `payload.wPayload.answer.sdp` to
-extract ICE credentials. Without this, the camera cannot form valid STUN
-binding requests.
-
-### Fix C: Flip DTLS to passive for echo-only cameras (commit b0a0fff)
-
-For echo-only cameras, sending `setup:passive` in `webrtcResp` makes the
-camera the DTLS active/client (ICE-controlling). The camera then allocates
-a TURN relay and sends `iceCandidateReq` → ICE connects via relay.
+| Item | Notes |
+|---|---|
+| SDES-path two-way audio | TUTK `avSendAudioData` + `SFrameInfo` (separate transport from DTLS) |
+| HA two-way-audio entity | Bridge browser mic → camera (go2rtc/WebRTC backhaul) |
+| `#35` Frida intercept | Blocked on AVD/hardware; protocol already understood without it |
+| Deeper ICE fix | Override aioice nomination to follow the camera's active port (high risk; retry suffices) |
 
 ---
 
-## Implementation Order
+## Architecture (quick reference)
 
-1. ✅ Fix A: Subscribe to userUuid topics (commit 8b74fa7)
-2. ✅ Fix B: Add wPayload.answer to webrtcResp (commit 077faaf)
-3. ✅ Fix C: Flip DTLS setup to passive for echo-only (commit b0a0fff)
-4. ✅ Fix 1: Parallelize HTTP pre-flight calls (this PR)
-5. ✅ Fix 2: Event-driven liveplay_echo_ev wait (this PR)
-6. ✅ Fix 3: Reduce echo secondary wait 6 s → 3 s (this PR)
-7. ✅ Fix 4: Guard echo-only cam_ip_q pre-seed (this PR)
-8. ✅ Fix 5: Log echo-only diagnostic info (this PR)
-
-## Files Modified
-
-- `aidot/device_client.py`:
-  - Lines ~2632: parallelize gather
-  - Lines ~2795: replace serial fetch with status log
-  - Line ~3168: `sleep(0.5)` → `wait_for(liveplay_echo_ev, 0.5)`
-  - Line ~3838: `timeout=6.0` → `timeout=3.0`
-  - Lines ~4038: `and not _rr_echo_only` guard + diagnostic log
-
-## Testing
-
-Run `python test_camera.py` against camera `12b144cb12da4994945bffd4f1acfd0c`
-and check:
-- Does ICE succeed (`ICE connectionState → connected`)?
-- Is the "parallel fetch" status logged (confirms both HTTP calls ran concurrently)?
-- Does "echo-only: skipping cam_ip_q pre-seed" appear when applicable?
-- Are frames received within 5 s of stream open (vs previous ~20–30 s)?
+- **Lights:** fully local (TCP 10000, AES) after credential cache.
+- **Cameras:** cloud MQTT broker (`{region}-mqtt.arnoo.com`) for signaling;
+  WebRTC media is pure LAN once ICE completes.
+- **DTLS path (A000088):** aiortc; video H264, audio PCMA both directions.
+- **SDES path (A001064/A001513):** hand-built SDP + ffmpeg; SCTP inside 0xC8.
+- **Thumbnails/recordings:** cloud-only (`{region}-smarthome.arnoo.com`).
+- **HA video:** go2rtc RTSP republish; `async_stream_source()` returns the RTSP URL.

@@ -181,3 +181,6 @@ extract.sh
 test-*.sh
 camera_test_runner.sh
 research/tutk_bridge/android-bionic/aosp_arm64-exp-RP1A/system.img
+
+# Local venv rebuild snapshot (dev artifact)
+requirements-venv-snapshot.txt

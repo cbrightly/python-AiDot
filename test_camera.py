@@ -922,16 +922,39 @@ async def run(args: argparse.Namespace) -> None:
                     print(f"    Talk: {_talk_desc} for {args.talk_seconds}s "
                           f"({_talk_max_frames} frames), then silence")
 
+                # A000088 cameras have a non-standard ICE-lite implementation
+                # that intermittently fails the DTLS handshake or never nominates
+                # a usable candidate pair (the camera sends media from a port ICE
+                # didn't select).  Each attempt is independent, so a bounded retry
+                # turns a ~50%/attempt success rate into ~90%+.  The HA coordinator
+                # already auto-reconnects; this gives the CLI the same resilience.
+                _wrtc_session = None
+                _max_tries = max(1, args.webrtc_retries)
+                for _try_n in range(1, _max_tries + 1):
+                    try:
+                        _wrtc_session = await dc.async_open_webrtc_stream(
+                            on_frame=_wrtc_on_frame,
+                            output_path=_out_path,
+                            max_seconds=args.webrtc_seconds,
+                            timeout=args.webrtc_timeout,
+                            status_callback=_wrtc_status,
+                            force_sdes=_force_sdes,
+                            talk_pcm_provider=_talk_provider,
+                        )
+                        break
+                    except ImportError as _ie:
+                        print(f"    SKIP: {_ie}")
+                        break
+                    except Exception as _e:
+                        print(f"    connect attempt {_try_n}/{_max_tries} failed: {_e}")
+                        if _try_n < _max_tries:
+                            await asyncio.sleep(2.0)
                 try:
-                    _wrtc_session = await dc.async_open_webrtc_stream(
-                        on_frame=_wrtc_on_frame,
-                        output_path=_out_path,
-                        max_seconds=args.webrtc_seconds,
-                        timeout=args.webrtc_timeout,
-                        status_callback=_wrtc_status,
-                        force_sdes=_force_sdes,
-                        talk_pcm_provider=_talk_provider,
-                    )
+                    if _wrtc_session is None:
+                        raise RuntimeError(
+                            f"could not establish WebRTC stream after"
+                            f" {_max_tries} attempt(s)"
+                        )
                     print(f"    WebRTC connected — streaming for {args.webrtc_seconds}s"
                           f"  (Ctrl+C to stop early)")
                     try:
@@ -1100,6 +1123,10 @@ def main() -> None:
                              "heartbeats for the full duration.")
     parser.add_argument("--webrtc-timeout", type=float, default=30.0,
                         help="Seconds to wait for WebRTC ICE connection (default: 30)")
+    parser.add_argument("--webrtc-retries", type=int, default=3,
+                        help="Connection attempts before giving up (default: 3). "
+                             "A000088 cameras intermittently fail ICE/DTLS; each "
+                             "attempt is independent so retrying usually connects.")
     parser.add_argument("--webrtc-protocol", metavar="{sdes|dtls|auto}",
                         default="auto",
                         help="Force streaming protocol. 'auto' (default) selects based "

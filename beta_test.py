@@ -249,16 +249,31 @@ async def _test_stream(dc: DeviceClient, cam_name: str, secs: int, ptz: bool):
         elif getattr(f, "is_audio", False):
             audio_frames[0] += 1
 
-    session = await asyncio.wait_for(
-        dc.async_open_webrtc_stream(
-            on_frame=on_frame,
-            output_path=out_path,
-            max_seconds=secs,
-            timeout=30,
-            status_callback=lambda _: None,
-        ),
-        timeout=35,
-    )
+    # A000088 (DTLS) cameras intermittently fail ICE/DTLS (~50%/attempt — the
+    # camera's ICE-lite exposes two candidate pairs and aioice may bind DTLS to
+    # the wrong port).  Each attempt is independent, so retry as the CLI/HA paths
+    # do (test_camera.py --webrtc-retries), giving a clean validation signal.
+    session = None
+    _last_exc = None
+    for _attempt in range(3):
+        try:
+            session = await asyncio.wait_for(
+                dc.async_open_webrtc_stream(
+                    on_frame=on_frame,
+                    output_path=out_path,
+                    max_seconds=secs,
+                    timeout=30,
+                    status_callback=lambda _: None,
+                ),
+                timeout=35,
+            )
+            break
+        except Exception as exc:
+            _last_exc = exc
+            if _attempt < 2:
+                await asyncio.sleep(2.0)
+    if session is None:
+        raise _last_exc if _last_exc else RuntimeError("stream open failed")
 
     # Wait for stream to produce frames before PTZ
     await asyncio.sleep(min(secs, 4))

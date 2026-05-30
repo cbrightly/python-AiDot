@@ -6324,59 +6324,124 @@ class DeviceClient(object):
                 except Exception as _np_fp_exc:
                     _status(f"fingerprint bypass skipped: {_np_fp_exc}")
 
-            # Strip H265 from the answer before giving to aiortc.  aiortc manages
-            # only 3 sections (audio/H264/DC at mids 0/1/2); any H265 stub causes
-            # OperationError regardless of PT or direction.  The _inject_h265_section
-            # pipeline added H265 as mid:2 and shifted DC to mid:3 in the SENT offer.
-            # Here we reverse that for aiortc: drop mid:2 (H265 stub, port=0) and
-            # rename mid:3 (DC) → mid:2 so aiortc sees the 3 sections it knows.
-            import re as _re_h265_strip
-            def _aiortc_answer(sdp: str) -> str:
-                """Produce a 3-section answer SDP for aiortc (audio/H264/DC).
+            # Rebuild the camera's answer into the 3 sections aiortc manages
+            # (audio/H264/DC at mids 0/1/2), in aiortc's offer order.  H265-capable
+            # firmware (A000088) may answer with 4 sections, reorder them, or pad a
+            # bogus single-PT video stub — all of which break aiortc's positional
+            # matching.  _aiortc_answer() below selects by content and re-emits.
+            import re as _re_ans  # module has no top-level `import re`
+            # Our offer's video payload types (H264 + RTX), used to pick the
+            # camera's REAL video answer section apart from H265/bogus stubs.
+            _offer_video_pts: set = set()
+            for _ol in _offer_sdp.splitlines():
+                if _ol.startswith('m=video'):
+                    _offer_video_pts = set(_ol.split()[3:])
+                    break
 
-                aiortc has 3 transceivers: audio(mid:0), H264(mid:1), DC(mid:2).
-                The full rebuild may have fewer sections (camera only answered
-                audio+H264; H265 was stubbed/rejected from BUNDLE; DC was stripped
-                from the sent offer).  This function:
-                  1. Strips any H265 stubs (port=0 video).
-                  2. Renames DC mid:3 → mid:2 if present (legacy path).
-                  3. If no DC section exists, synthesises one using the camera's
-                     ICE credentials so aiortc can bring up the SCTP transport.
-                  4. Ensures a=group:BUNDLE includes mids 0, 1, 2.
+            def _aiortc_answer(sdp: str) -> str:
+                """Produce a 3-section answer SDP for aiortc (audio/H264/DC),
+                in aiortc's fixed transceiver order regardless of how the camera
+                ordered or padded its reply.
+
+                aiortc matches answer m-sections to its transceivers BY POSITION:
+                audio(mid:0), H264(mid:1), DC(mid:2).  H265-capable firmware
+                (A000088) sometimes answers with 4 sections AND reorders them
+                (e.g. video / audio / video / application) and/or includes a bogus
+                single-PT video stub.  Positional matching then fails with
+                "Media sections in answer do not match offer".
+
+                This selects by CONTENT and re-emits in offer order:
+                  1. audio  = first m=audio section.
+                  2. video  = the m=video section whose payload types intersect
+                     our offer's video PTs (the real H264 answer), preferring the
+                     one with the most overlap; falls back to the m=video with the
+                     most PTs.  Bogus/H265 stubs are dropped.
+                  3. DC     = first m=application section, or a synthesised stub
+                     using the camera's ICE credentials.
+                Each selected section's a=mid is rewritten to 0/1/2 and BUNDLE is
+                normalised to "0 1 2".
                 """
-                _lines2 = _re_h265_strip.split(r'\r?\n', sdp)
+                _lines2 = _re_ans.split(r'\r?\n', sdp)
                 _secs2, _cur2 = [], []
                 for _l2 in _lines2:
                     if _l2.startswith('m=') and _cur2:
                         _secs2.append(_cur2); _cur2 = [_l2]
                     else:
                         _cur2.append(_l2)
-                if _cur2: _secs2.append(_cur2)
-                _out2: list[str] = []
-                _has_dc = False
-                for _sec2 in _secs2:
-                    if _sec2 and _sec2[0].startswith('m=video') and _sec2[0].split()[1] == '0':
-                        continue  # strip H265 stub
-                    if _sec2 and _sec2[0].startswith('m=application'):
-                        _has_dc = True
-                    # Rename DC mid:3 → mid:2 (if DC present from 4-section rebuild)
-                    _out2.extend('a=mid:2' if _l2.rstrip() == 'a=mid:3' else _l2 for _l2 in _sec2)
-                if not _has_dc:
-                    # Synthesise DC stub for aiortc's DC transceiver (mid:2).
-                    # Use camera's ICE credentials so the SCTP handshake succeeds.
+                if _cur2:
+                    _secs2.append(_cur2)
+
+                _audio_secs = [s for s in _secs2 if s and s[0].startswith('m=audio')]
+                _video_secs = [s for s in _secs2 if s and s[0].startswith('m=video')]
+                _app_secs   = [s for s in _secs2 if s and s[0].startswith('m=application')]
+
+                def _set_mid(_sec: list, _mid: str) -> list:
+                    _seen_mid = False
+                    _res = []
+                    for _l in _sec:
+                        if _l.startswith('a=mid:'):
+                            _res.append(f'a=mid:{_mid}')
+                            _seen_mid = True
+                        else:
+                            _res.append(_l)
+                    if not _seen_mid:
+                        # Insert mid right after the m= line.
+                        _res.insert(1, f'a=mid:{_mid}')
+                    return _res
+
+                _out_secs: list[list[str]] = []
+
+                # 1. audio → mid:0
+                if _audio_secs:
+                    _out_secs.append(_set_mid(_audio_secs[0], '0'))
+
+                # 2. real video → mid:1 (pick best PT overlap with our offer)
+                _best_video = None
+                _best_overlap = -1
+                for _vs in _video_secs:
+                    _pts = set(_vs[0].split()[3:])
+                    if _vs[0].split()[1] == '0':
+                        continue  # port-0 stub
+                    _overlap = len(_pts & _offer_video_pts)
+                    # Prefer real PT overlap; tie-break on PT count (richer section).
+                    _score = (_overlap, len(_pts))
+                    if _score > (_best_overlap, -1) and (_overlap > 0 or _best_video is None):
+                        _best_video = _vs
+                        _best_overlap = _overlap
+                if _best_video is None and _video_secs:
+                    # No overlap at all — fall back to the richest non-stub video.
+                    _best_video = max(
+                        (s for s in _video_secs if s[0].split()[1] != '0'),
+                        key=lambda s: len(s[0].split()[3:]),
+                        default=None,
+                    )
+                if _best_video is not None:
+                    _out_secs.append(_set_mid(_best_video, '1'))
+
+                # 3. datachannel → mid:2
+                if _app_secs:
+                    _out_secs.append(_set_mid(_app_secs[0], '2'))
+                else:
                     _dc_stub = [
                         'm=application 9 UDP/DTLS/SCTP webrtc-datachannel',
                         'c=IN IP4 0.0.0.0',
                         'a=mid:2',
                     ]
                     for _x2 in (_ice_ufrag_ln, _ice_pwd_ln, _fp_ln, _setup_ln):
-                        if _x2: _dc_stub.append(_x2)
+                        if _x2:
+                            _dc_stub.append(_x2)
                     _dc_stub.extend(['a=sctp-port:5000', 'a=max-message-size:262144'])
-                    _out2.extend(_dc_stub)
+                    _out_secs.append(_dc_stub)
+
+                # Session header = everything before the first m= section.
+                _header = _secs2[0] if (_secs2 and not _secs2[0][0].startswith('m=')) else []
+                _out2: list[str] = list(_header)
+                for _sec in _out_secs:
+                    _out2.extend(_sec)
                 sdp2 = '\r\n'.join(_out2)
-                # Ensure BUNDLE includes 0, 1, 2.
+                # Ensure BUNDLE includes 0, 1, 2 in order.
                 if 'a=group:BUNDLE' in sdp2:
-                    sdp2 = _re_h265_strip.sub(
+                    sdp2 = _re_ans.sub(
                         r'a=group:BUNDLE [0-9 ]+',
                         'a=group:BUNDLE 0 1 2',
                         sdp2, count=1,
