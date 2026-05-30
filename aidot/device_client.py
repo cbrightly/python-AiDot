@@ -3645,7 +3645,30 @@ class DeviceClient(object):
                     _orig_create_ctx = _AidotRTCCert._create_ssl_context
                     _DTLS1_VERSION = 0xFEFF  # not exposed in pyOpenSSL; raw OpenSSL constant
                     def _aidot_create_ssl_context(self, srtp_profiles):
-                        _ctx = _orig_create_ctx(self, srtp_profiles)
+                        try:
+                            _ctx = _orig_create_ctx(self, srtp_profiles)
+                        except TypeError:
+                            # Older pyOpenSSL (<24) requires OpenSSL.crypto.X509
+                            # / PKey for use_certificate / use_privatekey, but
+                            # aiortc 1.14 passes cryptography objects directly,
+                            # raising "cert must be an X509 instance".  This hit
+                            # on a Pi deployment and crashed every DTLS attempt
+                            # in RTCPeerConnection.__connect().  Convert the
+                            # cert/key to legacy pyOpenSSL types in place
+                            # (idempotent via isinstance) and retry the original
+                            # builder so its cipher list, SRTP profiles and
+                            # verify settings are preserved.  Keeps DTLS working
+                            # across pyOpenSSL versions (HA addons may ship old).
+                            from OpenSSL import crypto as _ossl_crypto
+                            if not isinstance(self._cert, _ossl_crypto.X509):
+                                self._cert = _ossl_crypto.X509.from_cryptography(
+                                    self._cert
+                                )
+                            if not isinstance(self._key, _ossl_crypto.PKey):
+                                self._key = _ossl_crypto.PKey.from_cryptography_key(
+                                    self._key
+                                )
+                            _ctx = _orig_create_ctx(self, srtp_profiles)
                         try:
                             _ctx.set_min_proto_version(_DTLS1_VERSION)
                         except Exception as _e:
