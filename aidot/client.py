@@ -229,12 +229,12 @@ class AidotClient:
             self.login_info[CONF_ACCESS_TOKEN] = response_data[CONF_ACCESS_TOKEN]
             if response_data[CONF_REFRESH_TOKEN] is not None:
                 self.login_info[CONF_REFRESH_TOKEN] = response_data[CONF_REFRESH_TOKEN]
-            _LOGGER.info("refresh token %s", response_data)
+            _LOGGER.debug("refresh token ok  code=%s", response_data.get(CONF_CODE))
             if self._token_fresh_cb:
                 self._token_fresh_cb()
             return response_data
         except aiohttp.ClientError as e:
-            _LOGGER.info("async_refresh_token ClientError %s %s", e, response_data)
+            _LOGGER.info("async_refresh_token ClientError %s  code=%s", e, response_data.get(CONF_CODE))
             if response_data.get(CONF_CODE) == ServerErrorCode.LOGIN_INVALID:
                 raise AidotAuthFailed
             return None

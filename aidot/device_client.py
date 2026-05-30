@@ -1753,6 +1753,14 @@ class DeviceClient(object):
         props = getattr(self, "_raw_device", {}).get("properties") or {}
         return str(props.get("enableSdes", "0")) == "1"
 
+    @property
+    def is_battery_camera(self) -> bool:
+        """True for battery/low-power models (A001513, A001108, A001360).
+        Source: IpcServiceImpl.java B() — powerType=2 for these models.
+        """
+        model = getattr(getattr(self, "info", None), "model_id", None) or ""
+        return any(m in model for m in ("A001513", "A001108", "A001360"))
+
     def __init__(self, device: dict[str, Any], user_info: dict[str, Any]) -> None:
         self.ping_count = 0
         self.status = DeviceStatusData()
@@ -1795,7 +1803,7 @@ class DeviceClient(object):
         # Pre-populate _ip_address from the device-list entry if it contains
         # an IP field.  Covers cameras (e.g. LK.IPC.A001064) whose
         # batchGetDeviceUserInfo response returns no IP and whose firmware
-        # does not respond to getDevAttrReq with a setDevAttrNotif.
+        # does not push setDevAttrNotif promptly after user/connect.
         _dev_ip_init = (
             device.get("localIp") or device.get("ipAddress")
             or device.get("ip") or device.get("localIPAddress")
@@ -2281,17 +2289,14 @@ class DeviceClient(object):
         timeout: float = 8.0,
         ack_keyword: str = "setDevAttr",
     ) -> bool:
-        """Connect MQTT, wake camera, publish command, wait for ack.
+        """Connect MQTT, optionally wake battery camera, publish command, wait for ack.
 
         All setDevAttrReq callers in the APK (b6.java, LiveCameraView, etc.)
         are in live-view screens where the camera is already awake and MQTT-
-        connected.  Standalone (non-streaming) calls must wake the camera first
-        via lowPowerActiveStateReq (same sequence used before streaming) or the
-        camera won't be subscribed to the MQTT broker and will miss the command.
+        connected.  For battery cameras we send lowPowerActiveStateReq first so
+        the camera wakes and processes our command.
         """
         import json as _json
-        import random as _random
-        import time as _time
 
         smarthome_auth = await self._async_get_smarthome_auth()
         mqtt_user = (smarthome_auth or {}).get("mqttUser") or str(self.user_id)
@@ -2312,29 +2317,27 @@ class DeviceClient(object):
             f"iot/v1/c/{device_id}/#",
         ]
 
-        # Wake the camera before sending the control command.
-        # Battery cameras (batteryMode=2) and preconn cameras (sptPreconn=1)
-        # sleep between streaming sessions and disconnect from MQTT.  Without
-        # the wake call the camera will not be subscribed and ignores our
-        # setDevAttrReq silently (0 messages returned).
-        _wake_payload = _json.dumps({
-            "method":  "lowPowerActiveStateReq",
-            "service": "IPC",
-            "devId":   device_id,
-            "srcAddr": f"0.{user_id}",
-            "seq":     f"ap{_random.randint(1000000, 9999999)}",
-            "tst":     int(_time.time() * 1000),
-            "payload": {"devId": device_id, "status": "wakeup"},
-        })
-        _wake_topic = f"iot/v1/s/{user_id}/IPCAM/lowPowerActiveStateReq"
+        # Wake battery cameras before sending the control command.
+        # Battery cameras (batteryMode=2) sleep between sessions and disconnect
+        # from MQTT.  Without the wake call they miss our setDevAttrReq.
+        # Payload from DeviceWakeUpRepos.java — no srcAddr/seq/tst.
+        publish_items: list = []
+        if self.is_battery_camera:
+            _wake_payload = _json.dumps({
+                "method":  "lowPowerActiveStateReq",
+                "service": "IPC",
+                "devId":   device_id,
+                "userId":  str(user_id),
+                "payload": {"devId": device_id, "status": "wakeup"},
+            })
+            _wake_topic = f"iot/v1/s/{user_id}/IPCAM/lowPowerActiveStateReq"
+            publish_items.append((_wake_topic, _wake_payload))
+        publish_items.append((pub_topic, payload_str))
 
         messages = await _mqtt_session(
             mqtt_url, mqtt_user, mqtt_pwd, client_id,
             subscribe_topics=sub_topics,
-            publish_items=[
-                (_wake_topic, _wake_payload),   # wake camera (connect to MQTT)
-                (pub_topic,   payload_str),      # then send control command
-            ],
+            publish_items=publish_items,
             duration=timeout,
         )
 
@@ -2523,17 +2526,17 @@ class DeviceClient(object):
         *,
         timeout: float = 8.0,
     ) -> Optional[dict]:
-        """Read all camera attributes via MQTT getDevAttrReq.
+        """Read camera attributes by announcing user presence and waiting for setDevAttrNotif.
 
-        Sends a wake + getDevAttrReq and waits for setDevAttrNotif or
-        getDevAttrResp.  Returns the ``attr`` dict on success, else None.
+        Mirrors the official app flow (l.java + IpcServiceImpl.java):
+          1. Subscribe iot/v1/c/{userId}/# and iot/v1/cb/{deviceId}/#
+          2. Publish iot/v1/cb/{userId}/user/connect  (triggers camera to push state)
+          3. For battery cameras: publish lowPowerActiveStateReq to wake from deep sleep
+          4. Wait for camera-pushed setDevAttrNotif
 
-        Known attribute keys returned (may vary by firmware):
-          MotionDetection_Enable, LedOnOff, micEnable, nightVisionMode,
-          LightOnOff, trackingMode, ipAddress, sptPreconn, p2pCache
+        Returns the ``attr`` dict on success, else None.
         """
         import json as _json
-        import random as _random
         import time as _time
 
         smarthome_auth = await self._async_get_smarthome_auth()
@@ -2554,47 +2557,46 @@ class DeviceClient(object):
             f"iot/v1/cb/{device_id}/#",
             f"iot/v1/c/{device_id}/#",
         ]
-        _numeric_uid = None
-        try:
-            _numeric_uid = int(str(user_id).split("_")[0])
-        except Exception:
-            pass
 
-        _wake_payload = _json.dumps({
-            "method":  "lowPowerActiveStateReq",
-            "service": "IPC",
-            "devId":   device_id,
+        # Announce user presence — triggers online cameras to push setDevAttrNotif.
+        # Exact format from l.java P():
+        #   topic:   iot/v1/cb/{userId}/user/connect
+        #   payload: {service:"user", method:"connect", srcAddr:"0.{userId}",
+        #             payload:{timestamp:"yyyy-MM-dd HH:mm:ss.SSS"}}
+        _ts = _time.strftime("%Y-%m-%d %H:%M:%S.") + f"{int(_time.time() * 1000) % 1000:03d}"
+        _connect_topic   = f"iot/v1/cb/{user_id}/user/connect"
+        _connect_payload = _json.dumps({
+            "service": "user",
+            "method":  "connect",
             "srcAddr": f"0.{user_id}",
-            "seq":     f"ap{_random.randint(1000000, 9999999)}",
-            "tst":     int(_time.time() * 1000),
-            "payload": {"devId": device_id, "status": "wakeup"},
+            "payload": {"timestamp": _ts},
         })
-        _wake_topic = f"iot/v1/s/{user_id}/IPCAM/lowPowerActiveStateReq"
 
-        _get_payload = _json.dumps({
-            "method":  "getDevAttrReq",
-            "service": "IPC",
-            "devId":   device_id,
-            "srcAddr": f"0.{user_id}",
-            "seq":     f"ap{_random.randint(1000000, 9999999)}",
-            "tst":     int(_time.time() * 1000),
-            **({"userId": _numeric_uid} if _numeric_uid is not None else {}),
-            "payload": {"devId": device_id},
-        })
-        _get_topic = f"iot/v1/s/{user_id}/IPC/getDevAttrReq"
+        publish_items = [(_connect_topic, _connect_payload)]
+
+        # For battery cameras (lowPowerActiveState): send wake signal so the camera
+        # exits deep sleep and responds.  Payload from DeviceWakeUpRepos.java —
+        # keys are method/devId/userId/service/payload; no srcAddr/seq/tst.
+        if self.is_battery_camera:
+            _wake_topic   = f"iot/v1/s/{user_id}/IPCAM/lowPowerActiveStateReq"
+            _wake_payload = _json.dumps({
+                "method":  "lowPowerActiveStateReq",
+                "service": "IPC",
+                "devId":   device_id,
+                "userId":  str(user_id),
+                "payload": {"devId": device_id, "status": "wakeup"},
+            })
+            publish_items.append((_wake_topic, _wake_payload))
 
         messages = await _mqtt_session(
             mqtt_url, mqtt_user, mqtt_pwd, client_id,
             subscribe_topics=sub_topics,
-            publish_items=[
-                (_wake_topic, _wake_payload),
-                (_get_topic,  _get_payload),
-            ],
+            publish_items=publish_items,
             duration=timeout,
         )
 
         for topic, raw in messages:
-            if "setDevAttrNotif" not in topic and "getDevAttrResp" not in topic:
+            if "setDevAttrNotif" not in topic:
                 continue
             try:
                 msg = _json.loads(raw)
@@ -3951,8 +3953,8 @@ class DeviceClient(object):
                         lambda: _spt_preconn.__setitem__(0, True)
                     )
             elif method == "getDevAttrResp":
-                # Some camera firmware replies to getDevAttrReq with
-                # getDevAttrResp rather than the push notification setDevAttrNotif.
+                # Defensive: some camera firmware pushes getDevAttrResp rather
+                # than setDevAttrNotif.  Extract the LAN IP if present.
                 _extract_cam_ip("getDevAttrResp", inner, msg)
             elif method == "getIceConfigResp":
                 # Capture TURN server credentials so aiortc can use them.
@@ -4042,28 +4044,23 @@ class DeviceClient(object):
         _status(f"MQTT connected (clientId={mqtt_cid})")
 
         # ------------------------------------------------------------------ #
-        # Send getDevAttrReq to prompt the camera to report its LAN IP via
-        # setDevAttrNotif.  Required for ICE-lite cameras (e.g. LK.IPC.A001064)
-        # whose IP is absent from batchGetDeviceUserInfo and who do not send
-        # setDevAttrNotif spontaneously.  The setDevAttrNotif handler (below)
-        # enqueues the IP into cam_ip_q; the ICE wait loop converts it to a
-        # synthetic host candidate so aiortc can STUN-probe the camera.
-        # Sent unconditionally (both initial and DTLS-fallback sessions) because
-        # each session creates a new MQTT connection and a new cam_ip_q.
+        # Announce user presence (l.java P()) so the camera pushes its current
+        # state via setDevAttrNotif.  The setDevAttrNotif handler enqueues
+        # the camera's LAN IP into cam_ip_q so the ICE wait loop can
+        # synthesise a host candidate for direct LAN probing.
+        # Replaces the invented getDevAttrReq which does not exist in the APK.
         # ------------------------------------------------------------------ #
-        _dev_attr_req_payload = json.dumps({
-            "method":  "getDevAttrReq",
-            "service": "IPC",
-            "devId":   device_id,
-            "srcAddr": f"0.{user_id}",
-            "seq":     f"ap{random.randint(1000000, 9999999)}",
-            "tst":     int(time.time() * 1000),
-            **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
-            "payload": {"devId": device_id},
-        })
-        outgoing_q.put_nowait(
-            (f"iot/v1/s/{user_id}/IPC/getDevAttrReq", _dev_attr_req_payload)
-        )
+        import time as _time_attr
+        _ts_attr = _time_attr.strftime("%Y-%m-%d %H:%M:%S.") + f"{int(_time_attr.time() * 1000) % 1000:03d}"
+        outgoing_q.put_nowait((
+            f"iot/v1/cb/{user_id}/user/connect",
+            json.dumps({
+                "service": "user",
+                "method":  "connect",
+                "srcAddr": f"0.{user_id}",
+                "payload": {"timestamp": _ts_attr},
+            }),
+        ))
 
         # ------------------------------------------------------------------ #
         # Send getIceConfigReq first — this warms up the broker-side WebRTC
@@ -4114,17 +4111,15 @@ class DeviceClient(object):
             #   1. MQTT lowPowerActiveStateReq — reaches cameras already on MQTT
             #   2. HTTP lowPowerActiveState    — cloud push for deep-sleep cameras
             # Both are fire-and-forget; getIceConfigReq below confirms wakeup.
+            # Payload from n.java l() — publishes extendsObj directly (no outer wrapper).
             _wake_mqtt_payload = json.dumps({
-                "id": device_id,
-                "extends": {
-                    "method": "lowPowerActiveStateReq",
+                "method":  "lowPowerActiveStateReq",
+                "devId":   device_id,
+                "userId":  user_id,
+                "service": "IPC",
+                "payload": {
                     "devId":  device_id,
-                    "userId": user_id,
-                    "service": "IPC",
-                    "payload": {
-                        "devId":  device_id,
-                        "status": "wakeup",
-                    },
+                    "status": "wakeup",
                 },
             })
             outgoing_q.put_nowait((
@@ -5318,25 +5313,23 @@ class DeviceClient(object):
                 f"  IceServerList×{len(_ice_server_list)}"
                 f"  payload={len(webrtc_req_payload)}B")
 
-        # Re-send getDevAttrReq now that the camera is confirmed awake
-        # (it responded to livePlayReq).  The first getDevAttrReq was sent
-        # at MQTT-setup time when the camera may have been sleeping; this
-        # second attempt gives ICE-lite cameras (e.g. LK.IPC.A001064) a
-        # better chance of returning setDevAttrNotif/getDevAttrResp with
-        # their LAN IP before the ICE wait loop starts.
+        # Re-announce user presence now that the camera is confirmed awake
+        # (it responded to livePlayReq).  The first user/connect was sent at
+        # MQTT-setup time; this second send gives ICE-lite cameras a better
+        # chance of pushing setDevAttrNotif with their LAN IP before the ICE
+        # wait loop starts.  Replaces the invented getDevAttrReq.
         if not _cam_local_ip:
+            import time as _time_attr2
+            _ts_attr2 = (_time_attr2.strftime("%Y-%m-%d %H:%M:%S.")
+                         + f"{int(_time_attr2.time() * 1000) % 1000:03d}")
             outgoing_q.put_nowait((
-                f"iot/v1/s/{user_id}/IPC/getDevAttrReq",
+                f"iot/v1/cb/{user_id}/user/connect",
                 json.dumps({
-                    "method":  "getDevAttrReq",
-                    "service": "IPC",
-                    "devId":   device_id,
+                    "service": "user",
+                    "method":  "connect",
                     "srcAddr": f"0.{user_id}",
-                    "seq":     _seq(),
-                    "tst":     int(time.time() * 1000),
-                    **( {"userId": _numeric_uid_raw} if _numeric_uid_raw is not None else {} ),
-                    "payload": {"devId": device_id},
-                })
+                    "payload": {"timestamp": _ts_attr2},
+                }),
             ))
 
         # Store ICE candidates for reconnect re-send (camera may quickConn-reset
@@ -6597,7 +6590,7 @@ class DeviceClient(object):
 
         deadline = time.monotonic() + timeout
         _last_ice_log = time.monotonic()
-        _devattr_midloop_sent = False  # guard: send getDevAttrReq once at half-timeout
+        _userconnect_midloop_sent = False  # guard: re-send user/connect once at half-timeout
         _second_ans_processed = False  # guard: process second_answer_fut candidates once
         _reconnect_resent_count = 0   # counter: re-send webrtcResp+ICE on each reconnect (max 3)
         while not connected_ev.is_set() and time.monotonic() < deadline:
@@ -6710,30 +6703,28 @@ class DeviceClient(object):
                     f"  remaining={deadline - time.monotonic():.0f}s"
                 )
                 _last_ice_log = time.monotonic()
-            # Mid-loop getDevAttrReq retry: if no camera IP yet and ~half of the
-            # ICE timeout has elapsed, send getDevAttrReq again.  The camera may
-            # have been slow to wake up or the first requests may have been lost.
+            # Mid-loop user/connect retry: if no camera IP yet and ~half of the
+            # ICE timeout has elapsed, re-announce user presence so the camera
+            # pushes setDevAttrNotif again.  Replaces the invented getDevAttrReq.
             _remaining = deadline - time.monotonic()
-            if (not _devattr_midloop_sent
+            if (not _userconnect_midloop_sent
                     and cam_ip_q.empty()
                     and _remaining > 0
                     and _remaining <= timeout / 2.0):
+                import time as _time_attr3
+                _ts_attr3 = (_time_attr3.strftime("%Y-%m-%d %H:%M:%S.")
+                             + f"{int(_time_attr3.time() * 1000) % 1000:03d}")
                 outgoing_q.put_nowait((
-                    f"iot/v1/s/{user_id}/IPC/getDevAttrReq",
+                    f"iot/v1/cb/{user_id}/user/connect",
                     json.dumps({
-                        "method":  "getDevAttrReq",
-                        "service": "IPC",
-                        "devId":   device_id,
+                        "service": "user",
+                        "method":  "connect",
                         "srcAddr": f"0.{user_id}",
-                        "seq":     _seq(),
-                        "tst":     int(time.time() * 1000),
-                        **( {"userId": _numeric_uid_raw}
-                            if _numeric_uid_raw is not None else {} ),
-                        "payload": {"devId": device_id},
-                    })
+                        "payload": {"timestamp": _ts_attr3},
+                    }),
                 ))
-                _devattr_midloop_sent = True
-                _status("getDevAttrReq re-sent (mid-loop, waiting for camera IP)")
+                _userconnect_midloop_sent = True
+                _status("user/connect re-sent (mid-loop, waiting for camera IP)")
             # Re-send webrtcResp + ICE candidates if camera reconnected during ICE.
             # LK.IPC.A001064 performs a quickConn MQTT reconnect after receiving
             # our webrtcResp; the reconnect resets its ICE agent so it no longer
