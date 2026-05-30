@@ -16,7 +16,17 @@
   "iot_class": "cloud_polling",
   "quality_scale": "bronze",
   "requirements": [
-    "python-aidot>=0.4.0"
+    "aiohttp",
+    "requests",
+    "paho-mqtt>=2.0",
+    "cryptography",
+    "pycryptodome",
+    "aiortc>=1.9.0",
+    "pylibsrtp",
+    "pyopenssl",
+    "av",
+    "numpy",
+    "Pillow"
   ],
   "version": "2.0.0"
 }
