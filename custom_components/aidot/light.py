@@ -25,10 +25,20 @@ async def async_setup_entry(
 ) -> None:
     """Set up Light."""
     coordinator = entry.runtime_data
-    async_add_entities(
-        AidotLight(device_coordinator)
-        for device_coordinator in coordinator.device_coordinators.values()
-    )
+    registered: set[str] = set()
+
+    def _add_new_lights() -> None:
+        new = [
+            AidotLight(c)
+            for dev_id, c in coordinator.device_coordinators.items()
+            if dev_id not in registered
+        ]
+        if new:
+            registered.update(c.unique_id for c in new)
+            async_add_entities(new)
+
+    _add_new_lights()
+    entry.async_on_unload(coordinator.async_add_listener(lambda: _add_new_lights()))
 
 
 class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
@@ -70,6 +80,8 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
         self._update_status()
 
     def _update_status(self) -> None:
+        if self.coordinator.data is None:
+            return
         self._attr_is_on = self.coordinator.data.on
         self._attr_brightness = self.coordinator.data.dimming
         self._attr_color_temp_kelvin = self.coordinator.data.cct
@@ -77,7 +89,11 @@ class AidotLight(CoordinatorEntity[AidotDeviceUpdateCoordinator], LightEntity):
 
     @property
     def available(self) -> bool:
-        return super().available and self.coordinator.data.online
+        return (
+            super().available
+            and self.coordinator.data is not None
+            and self.coordinator.data.online
+        )
 
     @callback
     def _handle_coordinator_update(self) -> None:

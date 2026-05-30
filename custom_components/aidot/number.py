@@ -35,6 +35,17 @@ CAMERA_NUMBERS: tuple[AidotNumberDescription, ...] = (
         get_value=lambda s: s.motion_sensitivity,
         async_set_fn=lambda c, v: c.async_set_motion_sensitivity(int(v)),
     ),
+    AidotNumberDescription(
+        key="speaker_volume",
+        translation_key="speaker_volume",
+        icon="mdi:volume-high",
+        native_min_value=0,
+        native_max_value=100,
+        native_step=1,
+        mode=NumberMode.SLIDER,
+        get_value=lambda s: s.speaker_volume,
+        async_set_fn=lambda c, v: c.async_set_speaker_volume(int(v)),
+    ),
 )
 
 
@@ -45,11 +56,25 @@ async def async_setup_entry(
 ) -> None:
     """Set up Aidot camera number entities."""
     coordinator = entry.runtime_data
-    entities: list[AidotCameraNumber] = []
-    for device_coordinator in coordinator.camera_coordinators.values():
-        for description in CAMERA_NUMBERS:
-            entities.append(AidotCameraNumber(device_coordinator, description))
-    async_add_entities(entities)
+    registered: set[str] = set()
+
+    def _add_new_numbers() -> None:
+        new_coords = {
+            dev_id: c
+            for dev_id, c in coordinator.camera_coordinators.items()
+            if dev_id not in registered
+        }
+        new = [
+            AidotCameraNumber(c, desc)
+            for c in new_coords.values()
+            for desc in CAMERA_NUMBERS
+        ]
+        if new:
+            registered.update(new_coords)
+            async_add_entities(new)
+
+    _add_new_numbers()
+    entry.async_on_unload(coordinator.async_add_listener(lambda: _add_new_numbers()))
 
 
 class AidotCameraNumber(CoordinatorEntity[AidotCameraUpdateCoordinator], NumberEntity):

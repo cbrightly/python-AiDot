@@ -73,6 +73,14 @@ CAMERA_SWITCHES: tuple[AidotSwitchDescription, ...] = (
         async_turn_on_fn=lambda c: c.async_set_ir_light(True),
         async_turn_off_fn=lambda c: c.async_set_ir_light(False),
     ),
+    AidotSwitchDescription(
+        key="siren",
+        translation_key="siren",
+        icon="mdi:alarm-light",
+        get_is_on=lambda s: s.siren,
+        async_turn_on_fn=lambda c: c.async_set_siren(True),
+        async_turn_off_fn=lambda c: c.async_set_siren(False),
+    ),
 )
 
 
@@ -83,11 +91,25 @@ async def async_setup_entry(
 ) -> None:
     """Set up Aidot camera switches."""
     coordinator = entry.runtime_data
-    entities: list[AidotCameraSwitch] = []
-    for device_coordinator in coordinator.camera_coordinators.values():
-        for description in CAMERA_SWITCHES:
-            entities.append(AidotCameraSwitch(device_coordinator, description))
-    async_add_entities(entities)
+    registered: set[str] = set()
+
+    def _add_new_switches() -> None:
+        new_coords = {
+            dev_id: c
+            for dev_id, c in coordinator.camera_coordinators.items()
+            if dev_id not in registered
+        }
+        new = [
+            AidotCameraSwitch(c, desc)
+            for c in new_coords.values()
+            for desc in CAMERA_SWITCHES
+        ]
+        if new:
+            registered.update(new_coords)
+            async_add_entities(new)
+
+    _add_new_switches()
+    entry.async_on_unload(coordinator.async_add_listener(lambda: _add_new_switches()))
 
 
 class AidotCameraSwitch(CoordinatorEntity[AidotDeviceUpdateCoordinator], SwitchEntity):
@@ -138,5 +160,3 @@ class AidotCameraSwitch(CoordinatorEntity[AidotDeviceUpdateCoordinator], SwitchE
         )
         self.async_write_ha_state()
 
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()

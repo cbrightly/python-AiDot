@@ -179,7 +179,12 @@ class AidotDeviceManagerCoordinator(DataUpdateCoordinator[None]):
     ) -> None:
         removed = set(coord_dict) - set(current)
         for dev_id in removed:
-            coord_dict.pop(dev_id).device_client.set_status_fresh_cb(None)
+            coord = coord_dict.pop(dev_id)
+            coord.device_client.set_status_fresh_cb(None)
+            if is_camera:
+                self.hass.async_create_task(
+                    coord.device_client.async_stop_streaming()
+                )
         if removed:
             self._purge_deleted_entries()
         for dev_id, device in current.items():

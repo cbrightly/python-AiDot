@@ -140,6 +140,8 @@ class DeviceStatusData:
     ir_light: Optional[bool] = None           # nightVisionIRLight 0/1
     floodlight: Optional[bool] = None
     ptz_tracking: Optional[bool] = None
+    siren: bool = False
+    speaker_volume: Optional[int] = None  # SoundLevel 0-100
 
     def update(self, attr: dict[str, Any]) -> None:
         if attr is None:
@@ -180,6 +182,8 @@ class DeviceStatusData:
             self.floodlight = bool(int(v))
         if (v := attr.get("trackingMode")) is not None:
             self.ptz_tracking = bool(int(v))
+        if (v := attr.get("SoundLevel")) is not None:
+            self.speaker_volume = int(v)
 
     def update_from_camera_attributes(self, attrs: dict) -> None:
         """Populate camera fields from async_get_camera_attributes() response."""
@@ -332,6 +336,11 @@ def _pack_frame(cmd: int, payload: bytes, sequence: Optional[int] = None) -> byt
         _HDR_RESERVE,
     )
     return header + payload
+
+
+def _mqtt_timestamp() -> str:
+    t = time.time()
+    return time.strftime("%Y-%m-%d %H:%M:%S.", time.localtime(t)) + f"{int(t * 1000) % 1000:03d}"
 
 
 async def _read_frame(reader: asyncio.StreamReader) -> tuple:
@@ -2488,8 +2497,11 @@ class DeviceClient(object):
     async def async_set_siren(self, on: bool) -> bool:
         # Siren uses devActionReq(action="playSound", in=[on,1,30])
         # in[0]=1/0, in[1]=type?, in[2]=duration seconds
-        return await self.async_trigger_device_action(
+        # No attr notification comes back — track state locally.
+        result = await self.async_trigger_device_action(
             "playSound", [1 if on else 0, 1, 30])
+        self.status.siren = on
+        return result
 
     async def async_set_night_vision(self, mode: str) -> bool:
         """mode: 'auto' (0), 'on' (1), 'off' (2)"""
@@ -2636,6 +2648,7 @@ class DeviceClient(object):
         """
         import aiohttp
 
+        await self._async_get_smarthome_auth()
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -2736,6 +2749,7 @@ class DeviceClient(object):
         """
         import aiohttp, time
 
+        await self._async_get_smarthome_auth()
         end_ts = int(time.time() * 1000)
         start_ts = end_ts - 30 * 86_400_000  # look back 30 days
 
@@ -4050,15 +4064,13 @@ class DeviceClient(object):
         # synthesise a host candidate for direct LAN probing.
         # Replaces the invented getDevAttrReq which does not exist in the APK.
         # ------------------------------------------------------------------ #
-        import time as _time_attr
-        _ts_attr = _time_attr.strftime("%Y-%m-%d %H:%M:%S.") + f"{int(_time_attr.time() * 1000) % 1000:03d}"
         outgoing_q.put_nowait((
             f"iot/v1/cb/{user_id}/user/connect",
             json.dumps({
                 "service": "user",
                 "method":  "connect",
                 "srcAddr": f"0.{user_id}",
-                "payload": {"timestamp": _ts_attr},
+                "payload": {"timestamp": _mqtt_timestamp()},
             }),
         ))
 
@@ -5319,16 +5331,13 @@ class DeviceClient(object):
         # chance of pushing setDevAttrNotif with their LAN IP before the ICE
         # wait loop starts.  Replaces the invented getDevAttrReq.
         if not _cam_local_ip:
-            import time as _time_attr2
-            _ts_attr2 = (_time_attr2.strftime("%Y-%m-%d %H:%M:%S.")
-                         + f"{int(_time_attr2.time() * 1000) % 1000:03d}")
             outgoing_q.put_nowait((
                 f"iot/v1/cb/{user_id}/user/connect",
                 json.dumps({
                     "service": "user",
                     "method":  "connect",
                     "srcAddr": f"0.{user_id}",
-                    "payload": {"timestamp": _ts_attr2},
+                    "payload": {"timestamp": _mqtt_timestamp()},
                 }),
             ))
 
@@ -6711,16 +6720,13 @@ class DeviceClient(object):
                     and cam_ip_q.empty()
                     and _remaining > 0
                     and _remaining <= timeout / 2.0):
-                import time as _time_attr3
-                _ts_attr3 = (_time_attr3.strftime("%Y-%m-%d %H:%M:%S.")
-                             + f"{int(_time_attr3.time() * 1000) % 1000:03d}")
                 outgoing_q.put_nowait((
                     f"iot/v1/cb/{user_id}/user/connect",
                     json.dumps({
                         "service": "user",
                         "method":  "connect",
                         "srcAddr": f"0.{user_id}",
-                        "payload": {"timestamp": _ts_attr3},
+                        "payload": {"timestamp": _mqtt_timestamp()},
                     }),
                 ))
                 _userconnect_midloop_sent = True

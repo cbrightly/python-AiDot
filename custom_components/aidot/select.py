@@ -42,11 +42,25 @@ async def async_setup_entry(
 ) -> None:
     """Set up Aidot camera select entities."""
     coordinator = entry.runtime_data
-    entities: list[AidotCameraSelect] = []
-    for device_coordinator in coordinator.camera_coordinators.values():
-        for description in CAMERA_SELECTS:
-            entities.append(AidotCameraSelect(device_coordinator, description))
-    async_add_entities(entities)
+    registered: set[str] = set()
+
+    def _add_new_selects() -> None:
+        new_coords = {
+            dev_id: c
+            for dev_id, c in coordinator.camera_coordinators.items()
+            if dev_id not in registered
+        }
+        new = [
+            AidotCameraSelect(c, desc)
+            for c in new_coords.values()
+            for desc in CAMERA_SELECTS
+        ]
+        if new:
+            registered.update(new_coords)
+            async_add_entities(new)
+
+    _add_new_selects()
+    entry.async_on_unload(coordinator.async_add_listener(lambda: _add_new_selects()))
 
 
 class AidotCameraSelect(CoordinatorEntity[AidotDeviceUpdateCoordinator], SelectEntity):

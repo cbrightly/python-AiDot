@@ -180,3 +180,4 @@ copy_to_macbook.sh
 extract.sh
 test-*.sh
 camera_test_runner.sh
+research/tutk_bridge/android-bionic/aosp_arm64-exp-RP1A/system.img

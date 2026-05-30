@@ -684,11 +684,10 @@ def main() -> None:
     args = parser.parse_args()
 
     if not (args.username and args.password):
-        loader = _load_credentials
-        if loader is None:
+        if _load_credentials is None:
             parser.error("aidot.credentials not available — provide --username/--password")
         try:
-            creds = loader(args.credentials)
+            creds = _load_credentials(args.credentials)
         except Exception as exc:
             parser.error(
                 f"Could not load credentials: {exc}\n"

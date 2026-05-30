@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
 
 import aiohttp
 from homeassistant.components.camera import Camera, CameraEntityFeature
@@ -13,14 +12,13 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import CONNECTION_NETWORK_MAC, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from .coordinator import AidotCameraUpdateCoordinator
 
 from .const import DOMAIN
-from .coordinator import AidotConfigEntry, AidotDeviceUpdateCoordinator
+from .coordinator import AidotCameraUpdateCoordinator, AidotConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
-# go2rtc RTSP server defaults (HA OS / Supervised built-in).
-# Override via AIDOT_GO2RTC_RTSP_BASE env var or coordinator config.
 _GO2RTC_RTSP_BASE = "rtsp://127.0.0.1:8554"
 
 
@@ -31,20 +29,30 @@ async def async_setup_entry(
 ) -> None:
     """Set up Aidot camera entities."""
     coordinator = entry.runtime_data
-    async_add_entities(
-        AidotCamera(device_coordinator)
-        for device_coordinator in coordinator.camera_coordinators.values()
-    )
+    registered: set[str] = set()
+
+    def _add_new_cameras() -> None:
+        new = [
+            AidotCamera(c)
+            for dev_id, c in coordinator.camera_coordinators.items()
+            if dev_id not in registered
+        ]
+        if new:
+            registered.update(c.unique_id for c in new)
+            async_add_entities(new)
+
+    _add_new_cameras()
+    entry.async_on_unload(coordinator.async_add_listener(lambda: _add_new_cameras()))
 
 
-class AidotCamera(CoordinatorEntity[AidotDeviceUpdateCoordinator], Camera):
+class AidotCamera(CoordinatorEntity[AidotCameraUpdateCoordinator], Camera):
     """Representation of an Aidot IP camera."""
 
     _attr_has_entity_name = True
     _attr_name = None
     _attr_supported_features = CameraEntityFeature.STREAM
 
-    def __init__(self, coordinator: AidotDeviceUpdateCoordinator) -> None:
+    def __init__(self, coordinator: AidotCameraUpdateCoordinator) -> None:
         CoordinatorEntity.__init__(self, coordinator)
         Camera.__init__(self)
         info = coordinator.device_client.info
@@ -70,7 +78,7 @@ class AidotCamera(CoordinatorEntity[AidotDeviceUpdateCoordinator], Camera):
         self._cached_image: bytes | None = None
         self._image_lock = asyncio.Lock()
 
-    async def async_stream_source(self) -> Optional[str]:
+    async def async_stream_source(self) -> str | None:
         """Return RTSP URL for HA stream integration (go2rtc → WebRTC browser).
 
         Starts a keepalive stream on first call so subsequent viewer connections

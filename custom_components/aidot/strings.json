@@ -37,6 +37,9 @@
     "number": {
       "motion_sensitivity": {
         "name": "Motion sensitivity"
+      },
+      "speaker_volume": {
+        "name": "Speaker volume"
       }
     },
     "switch": {
@@ -57,6 +60,9 @@
       },
       "ir_light": {
         "name": "IR light"
+      },
+      "siren": {
+        "name": "Siren"
       }
     },
     "select": {

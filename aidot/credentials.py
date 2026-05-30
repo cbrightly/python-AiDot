@@ -14,7 +14,6 @@ Priority order:
 import json
 import os
 import stat
-from typing import Optional
 
 _CONFIG_DIR = os.path.expanduser("~/.config/aidot")
 _DEFAULT_CREDS_FILE = os.path.join(_CONFIG_DIR, "credentials.json")
@@ -24,7 +23,7 @@ _KEY_FILE = os.path.join(_CONFIG_DIR, ".key")
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-def load_credentials(creds_path: Optional[str] = None) -> dict:
+def load_credentials(creds_path: str | None = None) -> dict:
     """Return {"username": ..., "password": ..., "country": ...}.
 
     Checks environment variables first, then encrypted file, then plain JSON.
@@ -41,10 +40,8 @@ def load_credentials(creds_path: Optional[str] = None) -> dict:
         }
 
     # Priority 2: Fernet-encrypted file
-    enc = creds_path and creds_path + ".enc"
-    key = creds_path and creds_path + ".key"
-    enc_path = enc or _ENC_FILE
-    key_path = key or _KEY_FILE
+    enc_path = (creds_path + ".enc") if creds_path else _ENC_FILE
+    key_path = (creds_path + ".key") if creds_path else _KEY_FILE
     if os.path.exists(enc_path) and os.path.exists(key_path):
         try:
             return _load_encrypted(enc_path, key_path)
@@ -76,7 +73,7 @@ def save_credentials(
     username: str,
     password: str,
     country: str = "US",
-    creds_path: Optional[str] = None,
+    creds_path: str | None = None,
 ) -> str:
     """Encrypt and store credentials. Returns the path where they were saved."""
     enc_path = (creds_path + ".enc") if creds_path else _ENC_FILE
@@ -85,14 +82,13 @@ def save_credentials(
     return enc_path
 
 
-def delete_credentials(creds_path: Optional[str] = None) -> None:
+def delete_credentials(creds_path: str | None = None) -> None:
     """Remove stored credentials (encrypted and/or plain JSON)."""
-    for path in (
-        (creds_path + ".enc") if creds_path else _ENC_FILE,
-        (creds_path + ".key") if creds_path else _KEY_FILE,
-        creds_path or _DEFAULT_CREDS_FILE,
-    ):
-        if path and os.path.exists(path):
+    enc_path = (creds_path + ".enc") if creds_path else _ENC_FILE
+    key_path = (creds_path + ".key") if creds_path else _KEY_FILE
+    plain    = creds_path or _DEFAULT_CREDS_FILE
+    for path in (enc_path, key_path, plain):
+        if os.path.exists(path):
             try:
                 os.unlink(path)
             except Exception:
@@ -131,9 +127,7 @@ def _save_encrypted(
     enc_path: str, key_path: str,
 ) -> None:
     Fernet = _fernet()
-    os.makedirs(os.path.dirname(os.path.abspath(enc_path)), exist_ok=True)
-
-    # Generate or reuse key
+    # Generate or reuse key — _write_secret handles makedirs
     if os.path.exists(key_path):
         with open(key_path, "rb") as f:
             key = f.read().strip()
@@ -143,8 +137,7 @@ def _save_encrypted(
 
     payload = json.dumps({"username": username, "password": password,
                           "country": country}).encode()
-    token = Fernet(key).encrypt(payload)
-    _write_secret(enc_path, token)
+    _write_secret(enc_path, Fernet(key).encrypt(payload))
 
 
 def _load_plain(path: str) -> dict:

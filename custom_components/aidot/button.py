@@ -80,13 +80,25 @@ async def async_setup_entry(
 ) -> None:
     """Set up Aidot PTZ buttons."""
     coordinator = entry.runtime_data
-    entities: list[AidotPtzButton] = []
-    for device_coordinator in coordinator.camera_coordinators.values():
-        if not _is_ptz_camera(device_coordinator):
-            continue
-        for description in PTZ_BUTTONS:
-            entities.append(AidotPtzButton(device_coordinator, description))
-    async_add_entities(entities)
+    registered: set[str] = set()
+
+    def _add_new_buttons() -> None:
+        new_coords = {
+            dev_id: c
+            for dev_id, c in coordinator.camera_coordinators.items()
+            if dev_id not in registered and _is_ptz_camera(c)
+        }
+        new = [
+            AidotPtzButton(c, desc)
+            for c in new_coords.values()
+            for desc in PTZ_BUTTONS
+        ]
+        if new:
+            registered.update(new_coords)
+            async_add_entities(new)
+
+    _add_new_buttons()
+    entry.async_on_unload(coordinator.async_add_listener(lambda: _add_new_buttons()))
 
 
 class AidotPtzButton(CoordinatorEntity[AidotCameraUpdateCoordinator], ButtonEntity):
