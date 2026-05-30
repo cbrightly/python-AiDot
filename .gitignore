@@ -184,3 +184,7 @@ research/tutk_bridge/android-bionic/aosp_arm64-exp-RP1A/system.img
 
 # Local venv rebuild snapshot (dev artifact)
 requirements-venv-snapshot.txt
+
+# Reverse-engineering artifacts (decompiled APK, SDK headers, binary analysis)
+# kept locally, purged from git history 2026-05-30 (backup: ~/aidot-research-backup-20260530)
+research/
