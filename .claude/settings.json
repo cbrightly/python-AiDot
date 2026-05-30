@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ffprobe *)",
+      "Bash(nm *)",
+      "Bash(readelf *)",
+      "Bash(objdump *)"
+    ]
+  }
+}

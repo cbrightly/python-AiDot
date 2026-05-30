@@ -39,7 +39,10 @@ except ImportError as e:
     print(f"ERROR: Cannot import aidot — run from the repo root.\n  {e}")
     sys.exit(1)
 
-_DEFAULT_CREDS = os.path.expanduser("~/.config/aidot/credentials.json")
+try:
+    from aidot.credentials import load_credentials as _load_credentials
+except ImportError:
+    _load_credentials = None
 _TS = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
@@ -653,15 +656,6 @@ async def run(args: argparse.Namespace) -> None:
 
 # ── CLI ─────────────────────────────────────────────────────────────────────── #
 
-def _load_creds(path: str) -> dict:
-    with open(path) as f:
-        data = json.load(f)
-    for k in ("username", "password"):
-        if k not in data:
-            raise ValueError(f"missing key {k!r}")
-    return data
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="AiDot camera beta readiness test suite",
@@ -671,7 +665,9 @@ def main() -> None:
     parser.add_argument("-u", "--username",  default=None)
     parser.add_argument("-P", "--password",  default=None)
     parser.add_argument("--country",         default=None)
-    parser.add_argument("-c", "--credentials", metavar="PATH", default=None)
+    parser.add_argument("-c", "--credentials", metavar="PATH", default=None,
+                        help="Path prefix for encrypted credentials "
+                             "(default: ~/.config/aidot/credentials)")
     parser.add_argument("-d", "--device",    metavar="NAME_OR_ID", default=None,
                         help="Test only this camera (partial name match)")
     parser.add_argument("--no-stream",   action="store_true",
@@ -688,22 +684,21 @@ def main() -> None:
     args = parser.parse_args()
 
     if not (args.username and args.password):
-        creds_path = args.credentials or (
-            _DEFAULT_CREDS if os.path.exists(_DEFAULT_CREDS) else None)
-        if creds_path:
-            try:
-                creds = _load_creds(creds_path)
-            except Exception as exc:
-                parser.error(f"Failed to load credentials: {exc}")
-            args.username = args.username or creds["username"]
-            args.password = args.password or creds["password"]
-            if args.country is None:
-                args.country = creds.get("country", "US")
-        else:
+        loader = _load_credentials
+        if loader is None:
+            parser.error("aidot.credentials not available — provide --username/--password")
+        try:
+            creds = loader(args.credentials)
+        except Exception as exc:
             parser.error(
-                "Provide --username/--password or save credentials with "
-                f"test_camera.py --save-credentials {_DEFAULT_CREDS}"
+                f"Could not load credentials: {exc}\n"
+                "  Set AIDOT_USERNAME/AIDOT_PASSWORD env vars or run "
+                "test_camera.py --save-credentials."
             )
+        args.username = args.username or creds["username"]
+        args.password = args.password or creds["password"]
+        if args.country is None:
+            args.country = creds.get("country", "US")
     if args.country is None:
         args.country = "US"
 

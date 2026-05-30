@@ -979,29 +979,10 @@ async def run(args: argparse.Namespace) -> None:
                         print(f"ERROR: {_e}")
 
 
-_DEFAULT_CREDS_PATH = os.path.expanduser("~/.config/aidot/credentials.json")
-
-
-def load_credentials(path: str) -> dict:
-    """Load username, password, and optional country from a JSON credentials file."""
-    with open(path) as f:
-        data = json.load(f)
-    for key in ("username", "password"):
-        if key not in data:
-            raise ValueError(f"credentials file {path!r} is missing required key {key!r}")
-    return data
-
-
-def save_credentials(path: str, username: str, password: str, country: str) -> None:
-    """Write credentials to a JSON file and restrict permissions to owner-only (0o600)."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    data = {"username": username, "password": password, "country": country}
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
-    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0o600 — owner read/write only
-    print(f"Credentials saved to {path} (permissions set to 0600).")
-    print("Keep this file private — it contains your AiDot password in plain text.")
+from aidot.credentials import (
+    load_credentials, save_credentials,
+    _DEFAULT_CREDS_FILE as _DEFAULT_CREDS_PATH,
+)
 
 
 def main() -> None:
@@ -1019,10 +1000,10 @@ def main() -> None:
                         help="JSON credentials file produced by --save-credentials. "
                              f"Auto-loaded from {_DEFAULT_CREDS_PATH} if it exists and "
                              "--username/--password are not given.")
-    parser.add_argument("--save-credentials", metavar="PATH", default=None,
-                        help="Save --username/--password/--country to a JSON file (0600 "
-                             "permissions) and exit. Use this once to avoid putting "
-                             "credentials on the command line for every run.")
+    parser.add_argument("--save-credentials", action="store_true", default=False,
+                        help="Encrypt and save --username/--password/--country to "
+                             "~/.config/aidot/credentials.enc and exit. Works on any platform "
+                             "without OS keychain dependencies.")
     parser.add_argument("-p", "--p2p", action="store_true",
                         help="Show device fields and probe the P2P UID endpoint "
                              "(also the default when no other action flag is given)")
@@ -1095,40 +1076,37 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # --save-credentials: write creds file and exit (needs explicit --username/--password)
+    # --save-credentials: encrypt credentials to file and exit
     if args.save_credentials:
         if not args.username or not args.password:
             parser.error("--save-credentials requires --username and --password")
-        save_credentials(
-            args.save_credentials,
+        path = save_credentials(
             args.username,
             args.password,
             args.country or "US",
+            args.credentials,
         )
+        print(f"Credentials saved to {path}")
         return
 
     # Credential resolution order:
     #   1. Explicit --username/--password on the command line (highest priority)
-    #   2. --credentials PATH
-    #   3. Auto-discover ~/.config/aidot/credentials.json
+    #   2. AIDOT_USERNAME / AIDOT_PASSWORD env vars (via load_credentials)
+    #   3. Encrypted credentials file (default or --credentials path)
+    #   4. Legacy plain JSON credentials file (auto-migrated to encrypted)
     if not (args.username and args.password):
-        creds_path = args.credentials or (
-            _DEFAULT_CREDS_PATH if os.path.exists(_DEFAULT_CREDS_PATH) else None
-        )
-        if creds_path:
-            try:
-                creds = load_credentials(creds_path)
-            except Exception as exc:
-                parser.error(f"Failed to load credentials from {creds_path!r}: {exc}")
-            args.username = args.username or creds["username"]
-            args.password = args.password or creds["password"]
-            if args.country is None:
-                args.country = creds.get("country", "US")
-        else:
+        try:
+            creds = load_credentials(args.credentials)
+        except Exception as exc:
             parser.error(
-                "Provide --username and --password, point --credentials at a JSON file, "
-                f"or run --save-credentials to create {_DEFAULT_CREDS_PATH}"
+                f"Could not load credentials: {exc}\n"
+                "  Provide --username/--password, set AIDOT_USERNAME/AIDOT_PASSWORD, "
+                "or run --save-credentials."
             )
+        args.username = args.username or creds["username"]
+        args.password = args.password or creds["password"]
+        if args.country is None:
+            args.country = creds.get("country", "US")
 
     if args.country is None:
         args.country = "US"
