@@ -870,6 +870,58 @@ async def run(args: argparse.Namespace) -> None:
                     elif args.verbose and not is_packet:
                         print(f"    {msg}")      # --verbose: session-level, no packets
 
+                # Two-way audio: build a talk PCM provider when --talk is set.
+                # The provider returns one 20ms frame (320 bytes s16le 8kHz mono)
+                # per call; None/short → the track emits silence.
+                _talk_provider = None
+                if args.talk:
+                    import os as _os_talk
+                    import sys as _sys_talk
+                    _tools_dir = _os_talk.path.join(
+                        _os_talk.path.dirname(_os_talk.path.abspath(__file__)), "tools")
+                    if _tools_dir not in _sys_talk.path:
+                        _sys_talk.path.insert(0, _tools_dir)
+                    try:
+                        import g711_tone as _g711
+                    except ImportError:
+                        _g711 = None
+
+                    if args.talk == "tone":
+                        # Exactly 1s of 440Hz @ 8kHz = 440 whole cycles → loops seamlessly.
+                        _talk_pcm = (_g711.tone_pcm(freq_hz=440.0, ms=1000)
+                                     if _g711 else b"\x00" * 16000)
+                        _talk_loop = True
+                        _talk_desc = "440Hz tone"
+                    else:
+                        with open(args.talk, "rb") as _tf:
+                            _talk_pcm = _tf.read()
+                        if args.talk.lower().endswith(".wav"):
+                            _talk_pcm = _talk_pcm[44:]  # strip standard 44-byte WAV header
+                        _talk_loop = False
+                        _talk_desc = f"{args.talk} ({len(_talk_pcm)} bytes PCM)"
+
+                    _FRAME_BYTES = 320  # 160 samples * 2 bytes (20ms @ 8kHz)
+                    _talk_state = {"pos": 0, "frames": 0}
+                    _talk_max_frames = int(args.talk_seconds / 0.02)
+
+                    def _talk_provider() -> "bytes | None":
+                        st = _talk_state
+                        if st["frames"] >= _talk_max_frames or not _talk_pcm:
+                            return None  # talk window elapsed → silence
+                        pos = st["pos"]
+                        chunk = _talk_pcm[pos:pos + _FRAME_BYTES]
+                        pos += _FRAME_BYTES
+                        if pos >= len(_talk_pcm):
+                            pos = 0 if _talk_loop else pos
+                        st["pos"] = pos
+                        st["frames"] += 1
+                        if st["frames"] == 1:
+                            print(f"    talk: first frame sent ({len(chunk)}B PCMA)")
+                        return chunk
+
+                    print(f"    Talk: {_talk_desc} for {args.talk_seconds}s "
+                          f"({_talk_max_frames} frames), then silence")
+
                 try:
                     _wrtc_session = await dc.async_open_webrtc_stream(
                         on_frame=_wrtc_on_frame,
@@ -878,6 +930,7 @@ async def run(args: argparse.Namespace) -> None:
                         timeout=args.webrtc_timeout,
                         status_callback=_wrtc_status,
                         force_sdes=_force_sdes,
+                        talk_pcm_provider=_talk_provider,
                     )
                     print(f"    WebRTC connected — streaming for {args.webrtc_seconds}s"
                           f"  (Ctrl+C to stop early)")
@@ -1051,6 +1104,14 @@ def main() -> None:
                         default="auto",
                         help="Force streaming protocol. 'auto' (default) selects based "
                              "on camera model (A000088→dtls, A001513/A001064→sdes)")
+    parser.add_argument("--talk", metavar="SRC", nargs="?", const="tone",
+                        help="Two-way audio: send viewer->camera audio during the "
+                             "WebRTC stream. SRC is 'tone' (440Hz test tone, default) "
+                             "or a path to an 8kHz mono s16le raw PCM / .wav file. "
+                             "Requires --webrtc.")
+    parser.add_argument("--talk-seconds", type=float, default=10.0,
+                        help="How long to transmit talk audio before going silent "
+                             "(default: 10s). The stream runs for --webrtc-seconds.")
     parser.add_argument("--lan-probe", action="store_true",
                         help="Probe LAN control interface (TCP:10000) on each camera. "
                              "Tests loginReq handshake with several AES key candidates "

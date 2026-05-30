@@ -1359,6 +1359,63 @@ class SdesSession:
             pass
 
 
+def _make_talk_audio_track(pcm_provider: Callable[[], "Optional[bytes]"]):
+    """Build an aiortc MediaStreamTrack that emits viewer→camera talk audio.
+
+    Mirrors the official app (f0.java:695): a real audio track is present on the
+    PeerConnection from the start, so the camera sees a genuine sender.  The
+    track emits 20 ms (160-sample) frames of signed-16-bit PCM at 8 kHz mono;
+    aiortc's RTCRtpSender encodes them to PCMA (PT=8) on the wire.
+
+    ``pcm_provider`` is called once per 20 ms frame and returns either 320 bytes
+    of s16le PCM (one frame) or ``None``/short data, in which case silence is
+    emitted.  Emitting silence (rather than stopping) keeps the track "present
+    but quiet" — the equivalent of the app's setEnabled(false) idle state.
+
+    Returns ``None`` if the optional ``av``/``aiortc`` deps are unavailable.
+    """
+    try:
+        import fractions
+        import av
+        from aiortc.mediastreams import MediaStreamTrack
+    except ImportError:
+        return None
+
+    _RATE = 8000
+    _SAMPLES = 160  # 20 ms @ 8 kHz
+    _SILENCE = b"\x00" * (_SAMPLES * 2)
+
+    class _TalkAudioTrack(MediaStreamTrack):
+        kind = "audio"
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._timestamp = 0
+
+        async def recv(self):
+            # Pace to real time: one 20 ms frame per 20 ms.
+            if self._timestamp:
+                await asyncio.sleep(_SAMPLES / _RATE)
+            try:
+                pcm = pcm_provider()
+            except Exception:
+                pcm = None
+            if not pcm or len(pcm) < _SAMPLES * 2:
+                pcm = _SILENCE
+            else:
+                pcm = pcm[: _SAMPLES * 2]
+
+            frame = av.AudioFrame(format="s16", layout="mono", samples=_SAMPLES)
+            frame.planes[0].update(pcm)
+            frame.sample_rate = _RATE
+            frame.pts = self._timestamp
+            frame.time_base = fractions.Fraction(1, _RATE)
+            self._timestamp += _SAMPLES
+            return frame
+
+    return _TalkAudioTrack()
+
+
 async def _webrtc_consume_video(track: Any, on_frame: Callable) -> None:
     """Receive video frames from an aiortc VideoStreamTrack and call on_frame."""
     while True:
@@ -3494,6 +3551,7 @@ class DeviceClient(object):
         _ice_config: "Optional[dict]" = None,
         _sdes_answer_timeout: Optional[float] = None,
         rtsp_push_url: Optional[str] = None,
+        talk_pcm_provider: "Optional[Callable[[], Optional[bytes]]]" = None,
     ) -> "WebRTCSession":
         """Open a liveType=2 WebRTC stream via MQTT signaling.
 
@@ -4518,7 +4576,23 @@ class DeviceClient(object):
         #
         # No sender tracks — camera is sendonly (a=sendonly in its answer SDP).
         # sendrecv on audio prevents direction-mismatch errors in the answer.
-        pc.addTransceiver("audio", direction="sendrecv")   # mid:0  audio (sendrecv; no sender track)
+        #
+        # Two-way audio (talk): when a talk_pcm_provider is supplied we attach a
+        # real PCMA sender track from the start, mirroring the official app
+        # (f0.java:695 createAudioTrack + addTrack, enabled only during talk).
+        # The track emits silence until the provider returns PCM, so the camera
+        # sees a genuine, continuously-present sender — the APK keeps the track
+        # present the whole session, so track presence is NOT the ~24s-teardown
+        # cause.  Audio is enabled on the wire by also sending AVIO SPEAKERSTART
+        # (848) once the DataChannel opens (see _send_avio_speaker below).
+        _talk_track = None
+        if talk_pcm_provider is not None:
+            _talk_track = _make_talk_audio_track(talk_pcm_provider)
+        if _talk_track is not None:
+            pc.addTrack(_talk_track)                        # mid:0  audio sender (PCMA talk)
+            _status("talk: attached PCMA sender track (two-way audio enabled)")
+        else:
+            pc.addTransceiver("audio", direction="sendrecv")  # mid:0  audio (no sender track)
         pc.addTransceiver("video", direction="recvonly")   # mid:1  H264 video
         # Wire capture (2026-05-02) of an official iOS Aidot session against
         # A000088 showed the camera answers with FOUR BUNDLE'd m-sections:
@@ -4603,6 +4677,25 @@ class DeviceClient(object):
                 _dc_ref.send(_hdr + _payload)
             except Exception:
                 pass
+
+        def _send_avio_speaker(_dc_ref, start: bool) -> None:
+            # IOTYPE_USER_IPCAM_SPEAKERSTART = 848 / SPEAKERSTOP = 849
+            # (AVIOCTRLDEFs.java:268-271).  The official app sends SPEAKERSTART
+            # when talk begins (f0.java:1500, startTalk m2()) to open the
+            # camera's speaker, and SPEAKERSTOP to close it.  Payload is
+            # SMsgAVIoctrlAVStream.parseContent(0) = 8 bytes, channel=0 LE.
+            try:
+                _cmd = 848 if start else 849
+                _seq = random.randint(0, 0x7fffffff)
+                _ts_ms = int(time.time() * 1000)
+                _payload = b'\x00' * 8  # channel=0
+                _hdr = struct.pack("<IIqII4x", _seq, _cmd, _ts_ms, len(_payload), 0)
+                _dc_ref.send(_hdr + _payload)
+                _status(f"talk: sent AVIO SPEAKER{'START' if start else 'STOP'}"
+                        f" ({_cmd})")
+            except Exception as _spk_exc:
+                _status(f"talk: SPEAKER{'START' if start else 'STOP'} failed:"
+                        f" {_spk_exc}")
 
         # Camera-initiated DCEP path: KVS firmware on A000088 doesn't include
         # m=application in its answer SDP, suggesting the data channel may
@@ -4704,6 +4797,9 @@ class DeviceClient(object):
                         )
                     _send_avio_living(_kvs_dc, _dc_label + " (PreCon)")
                     _send_avio_audiostart(_kvs_dc)
+                    # Talk mode: open the camera speaker so it plays our audio.
+                    if talk_pcm_provider is not None:
+                        _send_avio_speaker(_kvs_dc, True)
 
                     # Periodic keepalive loop:
                     # - HEARTBEAT (5156) every 10 s: prevents camera's ~22 s
@@ -4770,6 +4866,10 @@ class DeviceClient(object):
                 # zero-packet SR as "viewer not transmitting audio → stop
                 # sending audio to them."  We patch the sender's _send_rtcp
                 # to a no-op so no SR reaches the camera.
+                #
+                # In talk mode we attach a REAL PCMA sender, so its RTCP SR
+                # carries genuine packet counts — skip the suppression so the
+                # camera sees a properly-transmitting viewer.
                 async def _suppress_audio_sender_rtcp() -> None:
                     # Patch _send_rtcp on the sender instance to a no-op so
                     # the RTCP SR loop keeps running (no BYE sent) but every
@@ -4787,7 +4887,8 @@ class DeviceClient(object):
                                 " (suppresses 0-packet SR audio watchdog)"
                             )
                             break
-                asyncio.ensure_future(_suppress_audio_sender_rtcp())
+                if talk_pcm_provider is None:
+                    asyncio.ensure_future(_suppress_audio_sender_rtcp())
                 # Drain decoded audio frames so the queue doesn't grow unbounded.
                 async def _drain_audio() -> None:
                     try:
@@ -4804,15 +4905,35 @@ class DeviceClient(object):
                 # the start), H264 decoding silently drops every subsequent
                 # delta frame and we receive zero decoded frames.
                 async def _request_keyframe() -> None:
-                    await asyncio.sleep(0.5)  # brief settle after track setup
-                    try:
-                        for receiver in pc.getReceivers():
-                            if receiver.track is track:
-                                await receiver._send_rtcp_pli()
-                                _status("video track: sent RTCP PLI (keyframe request)")
-                                break
-                    except Exception as _pli_exc:
-                        _LOGGER.debug("RTCP PLI failed: %s", _pli_exc)
+                    # aiortc 1.14 changed _send_rtcp_pli(media_ssrc) to require
+                    # the remote SSRC.  The SSRC is only known once RTP starts
+                    # arriving, so poll getSynchronizationSources() briefly and
+                    # send PLI for each discovered source.
+                    for _attempt in range(10):  # up to ~5s
+                        await asyncio.sleep(0.5)
+                        try:
+                            _recv = next(
+                                (r for r in pc.getReceivers() if r.track is track),
+                                None,
+                            )
+                            if _recv is None:
+                                continue
+                            _ssrcs = [
+                                s.source
+                                for s in _recv.getSynchronizationSources()
+                            ]
+                            if not _ssrcs:
+                                continue
+                            for _ssrc in _ssrcs:
+                                await _recv._send_rtcp_pli(_ssrc)
+                            _status(
+                                f"video track: sent RTCP PLI (keyframe request)"
+                                f" ssrc={_ssrcs}"
+                            )
+                            return
+                        except Exception as _pli_exc:
+                            _LOGGER.debug("RTCP PLI attempt failed: %s", _pli_exc)
+                    _LOGGER.debug("RTCP PLI: no SSRC discovered within 5s")
                 asyncio.ensure_future(_request_keyframe())
                 if on_frame is not None:
                     t = asyncio.ensure_future(_webrtc_consume_video(track, on_frame))
