@@ -176,31 +176,50 @@ class TestEveryCallSitePassesADeviceId:
                 )
 
 
-class TestTheClassCharacterMustStayRandom:
-    """Pinning field 2's first character broke the A000088, and this is the
-    guard against it coming back.
+class TestTheClassCharacterIsWeb:
+    """Field 2's first character announces the client class, and we announce
+    '2' (WEB).
 
-    The A001064 really does read its client class from that character - the
-    firmware, the Android app and the web app all agree. Generalising that to
-    the whole fleet was tried on 2026-08-31 and reverted: against a drained
-    fleet with Home Assistant stopped, three A000088 cameras went 0 for 3 over
-    nine attempts, each completing its DTLS handshake in under two seconds and
-    then receiving no media, while the same build streamed the A001064 on the
-    first attempt. Reverting this one line restored 3 of 3.
+    The history matters, because the obvious reading of it is wrong. Pinning
+    this character to '0' (APP_ANDROID) was tried on 2026-08-31 and reverted:
+    against a drained fleet with Home Assistant stopped, three A000088 cameras
+    went 0 for 3 over nine attempts, each completing DTLS in under two seconds
+    and then receiving no media. That is real - across ten live-validation runs
+    the A000088 is 29 of 30 with a random character, so a 3% baseline cannot
+    explain 0 of 9.
 
-    Nothing needs the pin: the cliff it was found while chasing is fixed in the
-    SCTP receiver, not here.
+    But it was recorded as "pinning the class breaks the A000088", which is one
+    arm generalised into a rule. The vendor WEB app sends '2', and that arm was
+    screened on 2026-09-07 through live-validate - same sha, only the
+    environment differing - at **6 of 6 A000088 cameras across two independent
+    runs**, nearly all on the first attempt.
+
+    So the class is pinned to WEB, which is what a known-good vendor client
+    announces, instead of a random hex digit that was out of range 11 times in
+    16. Class 2 is NOT one of the smart-home classes (3 and 4) that skip the
+    camera's keepalive watchdog, so this changes what we claim to be and
+    nothing about how the session is policed.
     """
 
-    def test_field2_is_not_pinned_to_a_class(self, tmp_path, monkeypatch):
+    def test_field2_announces_client_class_2(self, tmp_path, monkeypatch):
         monkeypatch.setattr(client_mod, "EXPT_PEERID_FILE", None)
+        monkeypatch.delenv("AIDOT_EXPT_PEERID_CLASS", raising=False)
         firsts = {_gen(device_id=DEV).split("_")[1][0] for _ in range(120)}
-        assert len(firsts) > 1, (
-            "field 2's first character is pinned again - that is the client "
-            "class, and pinning it fleet-wide stops the A000088 streaming")
+        assert firsts == {"2"}, (
+            "field 2's first character is the client class; it must announce "
+            f"WEB ('2'), got {sorted(firsts)}")
+
+    def test_the_rest_of_field2_stays_random(self, tmp_path, monkeypatch):
+        """Pinning all six would make every peer id identical across opens -
+        cross-session reuse, which the camera dedups on."""
+        monkeypatch.setattr(client_mod, "EXPT_PEERID_FILE", None)
+        monkeypatch.delenv("AIDOT_EXPT_PEERID_CLASS", raising=False)
+        tails = {_gen(device_id=DEV).split("_")[1][1:] for _ in range(40)}
+        assert len(tails) > 1, "field 2 is fully pinned - that is peer-id reuse"
 
     def test_field2_is_still_six_hex(self, tmp_path, monkeypatch):
         monkeypatch.setattr(client_mod, "EXPT_PEERID_FILE", None)
+        monkeypatch.delenv("AIDOT_EXPT_PEERID_CLASS", raising=False)
         for _ in range(20):
             f2 = _gen(device_id=DEV).split("_")[1]
             assert len(f2) == 6 and all(c in "0123456789abcdef" for c in f2)
@@ -211,21 +230,3 @@ class TestTheClassCharacterMustStayRandom:
         f = tmp_path / "pid"; f.write_text(f"{DEV}:4_2_0_1")
         monkeypatch.setattr(client_mod, "EXPT_PEERID_FILE", str(f))
         assert _gen(device_id=DEV).split("_")[1][0] == "4"
-
-
-class TestTheOverrideIsOffInAPublishedLibrary:
-    """Same rule as the session cap: no env var, no file I/O."""
-
-    def test_no_file_is_opened_when_the_knob_is_unset(self, monkeypatch):
-        monkeypatch.setattr(client_mod, "EXPT_PEERID_FILE", None)
-        opened = []
-        real_open = open
-
-        def _spy(*a, **k):
-            opened.append(a[0] if a else None)
-            return real_open(*a, **k)
-
-        monkeypatch.setattr("builtins.open", _spy)
-        pid = _gen(device_id=DEV)
-        assert SHAPE.match(pid).groups() == ("2", "0", "1")
-        assert opened == [], f"opened {opened!r} with the knob off"

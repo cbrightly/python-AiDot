@@ -6574,15 +6574,26 @@ class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesO
         # random character's own baseline is 29/30 over ten runs, so the 0/9
         # was never background flakiness.
         #
-        # The character nonetheless stays random by default: shipping a pinned
-        # class is a behaviour change on a byte that has already caused a
-        # silent whole-model outage once, and nothing currently needs it - the
-        # 80.2 s cliff this was found while chasing is fixed in the SCTP
-        # receiver (see `_sctp_sack_chunk`), not here. Class 2 is the arm to
-        # ship if one is ever wanted; screen with `_expt_peer_id_class` (env)
-        # or `_expt_peer_id_fields` (file, per device) and get evidence from
-        # EACH model.
-        rand6   = os.urandom(3).hex()           # 6 hex chars, fresh per open
+        # SHIPPED as '2' on 2026-09-07, after the arm was also run under the
+        # exact condition the class-0 failure was found in: Home Assistant's
+        # config entry disabled so nothing held a session, fleet drained, opens
+        # driven from the LAN runner. Class 2 took 3 of 3 A000088 cameras on
+        # the first attempt there, against 0 of 9 attempts for class 0. Nine of
+        # nine across all screening runs.
+        #
+        # Announcing a truthful class beats announcing a random hex digit that
+        # was out of range 11 times in 16. Note class 2 is NOT one of the
+        # smart-home classes (3, 4) that skip the camera's keepalive watchdog,
+        # so this changes what we claim to be and nothing about how the session
+        # is policed. Screen any future change with `_expt_peer_id_class` (env)
+        # or `_expt_peer_id_fields` (file, per device), and get evidence from
+        # EACH model - the A000088's firmware has never been disassembled.
+        # Field 2 = client class + 5 random. '2' is EN_WEBRTC_CLIENT_TYPE_WEB,
+        # what the vendor web app announces. See the note above for why this
+        # is '2' and never '0'. The tail stays random: pinning all six would
+        # make every peer id identical across opens, which is the cross-session
+        # reuse the camera dedups on.
+        rand6   = "2" + os.urandom(3).hex()[1:]
         version = 1 if sdes else 2
         # Experiment override (off by default, fails closed, scoped to one
         # device): the camera reads its client class from field 2's first
