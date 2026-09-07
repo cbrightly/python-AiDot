@@ -26,7 +26,7 @@ jobs:
       - name: System deps
         run: apk add --no-cache git ffmpeg gcc musl-dev libffi-dev
       - name: Install package + test deps
-        run: pip install -e ".[webrtc]" pytest pytest-cov pytest-asyncio
+        run: pip install -e ".[webrtc]" pytest pytest-cov pytest-asyncio pyflakes
       - name: Run tests
         run: pytest tests/ -q -m "not e2e and not live" --ignore=tests/e2e --cov=aidot_cameras --cov-report=term-missing
 

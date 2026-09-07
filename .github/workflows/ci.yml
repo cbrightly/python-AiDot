@@ -85,7 +85,7 @@ jobs:
         # would silently not run any async test added outside tests/e2e.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[webrtc]" pytest pytest-cov pytest-asyncio
+          pip install -e ".[webrtc]" pytest pytest-cov pytest-asyncio pyflakes
       # Coverage is informational (term-missing report); it does not gate the build.
       # The suite includes tests/test_scripts_importable.py, which fails if any
       # scripts/ harness rots against the installed package (they all silently
