@@ -1163,6 +1163,37 @@ def _stable_terminal_id(seed: "Optional[str]" = None, width: int = 6) -> str:
 EXPT_PEERID_FILE = os.environ.get("AIDOT_EXPT_PEERID_FILE")
 
 
+#: Screening knob for the peer id's CLIENT CLASS only, off unless set.
+#: `_expt_peer_id_fields` covers the same ground but reads a file, and the
+#: live-validation harness can only pass environment variables - so an arm that
+#: has to run there needs this route.
+EXPT_PEERID_CLASS = "AIDOT_EXPT_PEERID_CLASS"
+
+
+def _expt_peer_id_class():
+    """One hex character to pin field 2's first character, or None.
+
+    The camera takes its client class from that character
+    (``client_type = field2[0] - '0'``). Pinning it to ``'0'`` (APP_ANDROID)
+    was tried and reverted - it breaks the A000088, which accepts the session
+    and then sends nothing. The vendor WEB app sends ``'2'``, and that arm has
+    never been screened; this exists to screen it.
+
+    **Pins the class character and nothing else.** The three trailing integers
+    encode transport, and an SDES tail pushed at a DTLS camera is silently
+    discarded - the failure mode an earlier unscoped knob produced. Those stay
+    exactly as computed.
+
+    Fails closed: anything that is not a single hex digit is ignored rather
+    than applied, because a peer id of the wrong shape is rejected outright and
+    would break every open rather than one arm of an experiment.
+    """
+    raw = (os.environ.get(EXPT_PEERID_CLASS) or "").strip()
+    if len(raw) != 1 or raw not in "0123456789abcdef":
+        return None
+    return raw
+
+
 def _expt_peer_id_fields(device_id=None, path=None):
     """Experiment override for one device's peer-id fields, or None.
 
@@ -6518,8 +6549,11 @@ class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesO
         # the vendor Android app hard-codes '0' there and the vendor web app
         # sends '2'. That is all verified.
         #
-        # **It is NOT verified for the rest of the fleet, and pinning it breaks
-        # the A000088.** Setting this character to '0' for every camera was
+        # **Pinning it to '0' breaks the A000088. Pinning it to '2' does not.**
+        # The two are not interchangeable and the earlier note here said only
+        # "pinning it breaks the A000088", which over-generalised one arm.
+        #
+        # Setting this character to '0' (APP_ANDROID) for every camera was
         # tried and reverted on 2026-08-31. Against a drained fleet with Home
         # Assistant stopped, three A000088 cameras went 0 for 3 over nine
         # attempts - each one completing its DTLS handshake in under two seconds
@@ -6533,17 +6567,43 @@ class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesO
         # ignore the byte - announcing APP_ANDROID makes it accept the session
         # and send nothing, which is worse than the random value it replaced.
         #
-        # So the character stays random. Nothing needs it: the 80.2 s cliff this
-        # was found while chasing is fixed in the SCTP receiver (see
-        # `_sctp_sack_chunk`), not here. Screen it per model with
-        # `_expt_peer_id_fields` before ever setting it again, and get evidence
-        # from EACH model's own firmware.
-        rand6   = os.urandom(3).hex()           # 6 hex chars, fresh per open
+        # Class '2' (WEB) - what the vendor web app sends - was screened on
+        # 2026-09-07 and does NOT break it: 6 of 6 A000088 cameras PASS across
+        # two independent live-validation runs, nearly all on the first
+        # attempt, against 0 of 9 attempts for class '0'. For reference the
+        # random character's own baseline is 29/30 over ten runs, so the 0/9
+        # was never background flakiness.
+        #
+        # SHIPPED as '2' on 2026-09-07, after the arm was also run under the
+        # exact condition the class-0 failure was found in: Home Assistant's
+        # config entry disabled so nothing held a session, fleet drained, opens
+        # driven from the LAN runner. Class 2 took 3 of 3 A000088 cameras on
+        # the first attempt there, against 0 of 9 attempts for class 0. Nine of
+        # nine across all screening runs.
+        #
+        # Announcing a truthful class beats announcing a random hex digit that
+        # was out of range 11 times in 16. Note class 2 is NOT one of the
+        # smart-home classes (3, 4) that skip the camera's keepalive watchdog,
+        # so this changes what we claim to be and nothing about how the session
+        # is policed. Screen any future change with `_expt_peer_id_class` (env)
+        # or `_expt_peer_id_fields` (file, per device), and get evidence from
+        # EACH model - the A000088's firmware has never been disassembled.
+        # Field 2 = client class + 5 random. '2' is EN_WEBRTC_CLIENT_TYPE_WEB,
+        # what the vendor web app announces. See the note above for why this
+        # is '2' and never '0'. The tail stays random: pinning all six would
+        # make every peer id identical across opens, which is the cross-session
+        # reuse the camera dedups on.
+        rand6   = "2" + os.urandom(3).hex()[1:]
         version = 1 if sdes else 2
         # Experiment override (off by default, fails closed, scoped to one
         # device): the camera reads its client class from field 2's first
         # character - see _expt_peer_id_fields.  Without a device id the
         # override never applies.
+        # Class-only screening knob (env), applied before the file override so
+        # a file naming this device still wins.
+        _cls = _expt_peer_id_class()
+        if _cls:
+            rand6 = _cls + rand6[1:]
         _fields = _expt_peer_id_fields(device_id)
         if _fields is not None:
             _term, live_type, stream_id, version = _fields

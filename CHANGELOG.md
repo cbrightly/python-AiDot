@@ -4,6 +4,47 @@ All notable changes to `python-aidot-cameras` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and this project uses
 date-less, incrementing versions published to PyPI via GitHub Releases.
 
+## [1.0.0rc14]
+
+### Changed
+
+- **Every session now tells the camera what kind of client it is.** The peer id
+  carries a client class in one character, and this library was filling it with
+  a random hex digit -- announcing a class the vendor does not define eleven
+  times in sixteen. It now announces `2`, `EN_WEBRTC_CLIENT_TYPE_WEB`, which is
+  what the vendor's own web app sends.
+
+  This was tried once before, with `0` (`APP_ANDROID`), and reverted the same
+  day because it stops the A000088 streaming: the camera accepts the session and
+  then sends nothing. That finding stands, and it was recorded as "pinning the
+  class breaks the A000088" -- one arm generalised into a rule. `2` is not `0`.
+
+  Screened before shipping, on the same commit with only the environment
+  differing:
+
+  | arm | A000088 |
+  |---|---|
+  | `0` APP_ANDROID | 0 of 3 cameras, 0 of 9 attempts |
+  | `2` WEB | **9 of 9 cameras across three runs**, nearly all first attempt |
+  | random (previous default) | 29 of 30 across ten runs |
+
+  The last of those three runs was made under the exact condition the class-0
+  failure was found in -- nothing else holding a session, fleet drained, opens
+  driven from the LAN -- where class 2 took 3 of 3 on the first attempt.
+
+  Class 2 is not one of the smart-home classes (3 and 4) that skip the camera's
+  keepalive watchdog, so this changes what a session claims to be and nothing
+  about how the camera polices it. The other five characters stay random:
+  pinning all six would make every peer id identical across opens, which is
+  cross-session reuse.
+
+### Added
+
+- `AIDOT_EXPT_PEERID_CLASS` screens that character without a file, for harnesses
+  that can only pass environment variables. It pins the class and nothing else --
+  the trailing integers encode transport, and an SDES tail sent to a DTLS camera
+  is silently discarded.
+
 ## [1.0.0rc13]
 
 ### Added
