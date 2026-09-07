@@ -271,6 +271,32 @@ projected on, now confirmed against the real box.
 day rc11 set day zero, and it is not streaming-breaking. Target stays
 2026-09-20.
 
+**Box configuration changed 2026-09-07 14:05: mains warm-hold 0 -> 120 s.**
+Not a release, so the clock is untouched, but it changes behaviour under soak
+and any window that straddles it is not comparable. Mains cameras now go
+dormant 120 s after the last viewer instead of being held warm forever.
+
+The reason is the A001064 PTZ. It stops sending media when nobody is watching
+and drops its ICE transport, so it cannot be held warm at all: the watchdog was
+restarting it indefinitely - 6 restarts in 20.7 h - and each teardown left the
+dying serve ffmpeg draining late RTP, emitting a burst of non-monotonic DTS
+(215 lines in 8 bursts, median 0.300 s backward, max 3.201 s against a 0.500 s
+reorder window). Live view tolerates it; Home Assistant's mp4 recorder does
+not, which is how a `camera.record` on a cold PTZ returned 500 while the stream
+itself was healthy. 7 of 8 bursts follow the stall/watchdog/ICE-gone triple
+within 3-9 s.
+
+**Verified working the same hour.** A primed session, then 180 s with no
+viewer, then a second open: `first-media +2588 ms`, `serving +2894 ms` with two
+full bridge/ffmpeg starts - a genuine cold open, where a warm session would
+have been instant. This also settles that idle-release works in SDES push mode
+(the go2rtc viewer query answers, so the `add stream ... 400` seen at setup is
+not blocking it) and that the cold-open cost is ~2.9 s, not the 15-22 s the
+integration's comments claimed.
+
+**What to watch:** `no media in watchdog window` for the PTZ should stop
+appearing. It fired every ~2.6 h before the change.
+
 *One caveat recorded rather than hidden:* the FIRST `camera.record` on the PTZ
 returned 500 with an mp4 muxer error (`non monotonically increasing dts`) on a
 COLD open; an immediate retry on the now-warm session returned 200. rc12
