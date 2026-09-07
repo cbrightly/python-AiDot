@@ -1163,6 +1163,37 @@ def _stable_terminal_id(seed: "Optional[str]" = None, width: int = 6) -> str:
 EXPT_PEERID_FILE = os.environ.get("AIDOT_EXPT_PEERID_FILE")
 
 
+#: Screening knob for the peer id's CLIENT CLASS only, off unless set.
+#: `_expt_peer_id_fields` covers the same ground but reads a file, and the
+#: live-validation harness can only pass environment variables - so an arm that
+#: has to run there needs this route.
+EXPT_PEERID_CLASS = "AIDOT_EXPT_PEERID_CLASS"
+
+
+def _expt_peer_id_class():
+    """One hex character to pin field 2's first character, or None.
+
+    The camera takes its client class from that character
+    (``client_type = field2[0] - '0'``). Pinning it to ``'0'`` (APP_ANDROID)
+    was tried and reverted - it breaks the A000088, which accepts the session
+    and then sends nothing. The vendor WEB app sends ``'2'``, and that arm has
+    never been screened; this exists to screen it.
+
+    **Pins the class character and nothing else.** The three trailing integers
+    encode transport, and an SDES tail pushed at a DTLS camera is silently
+    discarded - the failure mode an earlier unscoped knob produced. Those stay
+    exactly as computed.
+
+    Fails closed: anything that is not a single hex digit is ignored rather
+    than applied, because a peer id of the wrong shape is rejected outright and
+    would break every open rather than one arm of an experiment.
+    """
+    raw = (os.environ.get(EXPT_PEERID_CLASS) or "").strip()
+    if len(raw) != 1 or raw not in "0123456789abcdef":
+        return None
+    return raw
+
+
 def _expt_peer_id_fields(device_id=None, path=None):
     """Experiment override for one device's peer-id fields, or None.
 
@@ -6544,6 +6575,11 @@ class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesO
         # device): the camera reads its client class from field 2's first
         # character - see _expt_peer_id_fields.  Without a device id the
         # override never applies.
+        # Class-only screening knob (env), applied before the file override so
+        # a file naming this device still wins.
+        _cls = _expt_peer_id_class()
+        if _cls:
+            rand6 = _cls + rand6[1:]
         _fields = _expt_peer_id_fields(device_id)
         if _fields is not None:
             _term, live_type, stream_id, version = _fields
