@@ -295,6 +295,26 @@ happens on a fleet whose echo band is not empty.
 Battery models take neither wait; their cold open is dominated by the camera
 waking, and is unchanged.
 
+#### The older figures scattered through the tree predate this
+
+`25-70 s cold on SDES` and `15-21 s on DTLS` appear in roughly twenty comments
+across the library and the integration. They are pre-`rc8` and should not be
+read as current for a MAINS live open. Confirmed on the fleet 2026-09-07 over
+**11 real cold opens** (7 SDES, 4 DTLS, mains, taken from production logs rather
+than forced): the serve bound in **2.6-3.6 s, median 2.9 s**, with no meaningful
+split between transports.
+
+Two cautions before deleting any of them:
+
+- They do not all describe the same operation. Some size an **SD listing**,
+  which needs the session *and* an SCTP handshake on top, and that has not been
+  re-measured. Some describe a **battery** wake, which is dominated by the
+  camera and was never what `rc8` changed.
+- Several **size a timeout**. An over-sized upper bound on a wait that ends
+  early costs nothing, while an under-sized one reintroduces the failure it was
+  written for. Re-measure the specific path before retuning any of them; do not
+  propagate this number by search-and-replace.
+
 ### Connection reliability (SDES / battery)
 
 SDES cameras - including battery models (A001513) - stream end-to-end once the
@@ -384,7 +404,9 @@ if device_client.has_live_session:                       # sends nothing
     result = await device_client.async_get_sd_recordings(days=7)
 ```
 
-**Listing needs a WebRTC session** - 15-21 s on DTLS, 25-70 s cold on SDES, and
+**Listing needs a WebRTC session** - historically 15-21 s on DTLS and 25-70 s
+cold on SDES (pre-`rc8`; the session itself is now ~3 s, but the listing's own
+SCTP handshake has not been re-measured), and
 it wakes the camera - where the cloud equivalent is one ~200 ms request. So the
 library never opens one for a listing: it asks the session it is handed, or
 answers `None`. Deciding when a listing is worth a session is policy, and policy
