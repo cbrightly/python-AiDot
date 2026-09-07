@@ -4,6 +4,35 @@ All notable changes to `python-aidot-cameras` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and this project uses
 date-less, incrementing versions published to PyPI via GitHub Releases.
 
+## [1.0.0rc13]
+
+### Added
+
+- **The cameras type their detections, and now you can read and set that.**
+  These models separate a person from a vehicle from a package from a pet, and
+  the library only ever exposed motion on or off plus a sensitivity number.
+  `async_get_detection_types()` returns `{key: bool}` and
+  `async_set_detection_type(key, enabled)` arms one of them.
+
+  Probed read-only on real hardware before anything was written: an A000088 and
+  an A001064 both answer `getRoiHuman` with five flags -- `humanDetect`,
+  `vehicleDetect`, `packageDetect`, `petDetect` and `publicZone` -- and
+  `humanDetect` already reads 1 on both, so the hardware has been doing this
+  all along.
+
+  The setter is read-modify-write against the camera's own object rather than a
+  payload built from our own key list. `publicZone` rides in the same object
+  and is a real per-camera setting -- 0 on the A000088 and 1 on the A001064 in
+  the same probe -- so rebuilding the payload would silently reset something the
+  library does not model. Verified against both models: toggling `petDetect`
+  took, read back, and left `publicZone` and `humanDetect` untouched, and both
+  cameras were restored to their original state.
+
+  A camera that does not answer reads as **unknown**, never as all-off. A
+  battery A001513 answers nothing at all here because it is asleep, and
+  reporting that as four disabled detectors would invent a state it never
+  claimed.
+
 ## [1.0.0rc12]
 
 ### Fixed
