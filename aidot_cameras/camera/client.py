@@ -6549,8 +6549,11 @@ class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesO
         # the vendor Android app hard-codes '0' there and the vendor web app
         # sends '2'. That is all verified.
         #
-        # **It is NOT verified for the rest of the fleet, and pinning it breaks
-        # the A000088.** Setting this character to '0' for every camera was
+        # **Pinning it to '0' breaks the A000088. Pinning it to '2' does not.**
+        # The two are not interchangeable and the earlier note here said only
+        # "pinning it breaks the A000088", which over-generalised one arm.
+        #
+        # Setting this character to '0' (APP_ANDROID) for every camera was
         # tried and reverted on 2026-08-31. Against a drained fleet with Home
         # Assistant stopped, three A000088 cameras went 0 for 3 over nine
         # attempts - each one completing its DTLS handshake in under two seconds
@@ -6564,11 +6567,21 @@ class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesO
         # ignore the byte - announcing APP_ANDROID makes it accept the session
         # and send nothing, which is worse than the random value it replaced.
         #
-        # So the character stays random. Nothing needs it: the 80.2 s cliff this
-        # was found while chasing is fixed in the SCTP receiver (see
-        # `_sctp_sack_chunk`), not here. Screen it per model with
-        # `_expt_peer_id_fields` before ever setting it again, and get evidence
-        # from EACH model's own firmware.
+        # Class '2' (WEB) - what the vendor web app sends - was screened on
+        # 2026-09-07 and does NOT break it: 6 of 6 A000088 cameras PASS across
+        # two independent live-validation runs, nearly all on the first
+        # attempt, against 0 of 9 attempts for class '0'. For reference the
+        # random character's own baseline is 29/30 over ten runs, so the 0/9
+        # was never background flakiness.
+        #
+        # The character nonetheless stays random by default: shipping a pinned
+        # class is a behaviour change on a byte that has already caused a
+        # silent whole-model outage once, and nothing currently needs it - the
+        # 80.2 s cliff this was found while chasing is fixed in the SCTP
+        # receiver (see `_sctp_sack_chunk`), not here. Class 2 is the arm to
+        # ship if one is ever wanted; screen with `_expt_peer_id_class` (env)
+        # or `_expt_peer_id_fields` (file, per device) and get evidence from
+        # EACH model.
         rand6   = os.urandom(3).hex()           # 6 hex chars, fresh per open
         version = 1 if sdes else 2
         # Experiment override (off by default, fails closed, scoped to one
