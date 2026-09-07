@@ -142,6 +142,54 @@ class _CameraControlsMixin:
             return False
         return await self.async_trigger_device_action("soundAlgorithmSet", payload)
 
+    #: Detection types the camera reports under ``getRoiHuman``.  Names come
+    #: from the camera, not from us -- probed 2026-09-07 on an A000088 and an
+    #: A001064, both of which answer with all five.  ``publicZone`` is in the
+    #: same dict but is not a detection type; it is carried through untouched.
+    DETECTION_TYPE_KEYS = ("humanDetect", "vehicleDetect", "packageDetect",
+                           "petDetect")
+
+    async def async_get_detection_types(self) -> "Optional[dict]":
+        """Which detection types are armed, as ``{key: bool}``.
+
+        ``None`` means the camera did not answer -- unknown, NOT all-off.  A
+        battery A001513 answers nothing at all (measured: a null ``out`` for
+        every one of these actions, because it is asleep), and rendering that
+        as four switched-off detectors would claim a state it never reported.
+        """
+        out = await self.async_query_device_action("getRoiHuman")
+        roi = (out or {}).get("roi") if isinstance(out, dict) else None
+        if not isinstance(roi, list) or not roi or not isinstance(roi[0], dict):
+            return None
+        return {k: bool(v) for k, v in roi[0].items()}
+
+    async def async_set_detection_type(self, key: str, enabled: bool) -> bool:
+        """Arm or disarm one detection type.
+
+        Read-modify-write against the camera's own dict, like
+        ``async_set_sound_detection``.  Echoing the structure back matters more
+        here than it does for sound: the same dict carries ``publicZone``, which
+        is a real per-camera setting (0 on one model and 1 on another in the
+        same probe), so rebuilding the payload from our own key list would
+        silently reset a setting we do not model.
+        """
+        out = await self.async_query_device_action("getRoiHuman")
+        roi = (out or {}).get("roi") if isinstance(out, dict) else None
+        if not isinstance(roi, list) or not roi or not isinstance(roi[0], dict):
+            _LOGGER.warning(
+                "detection types: %s did not report its ROI; not writing",
+                self.device_id)
+            return False
+        current = roi[0]
+        if key not in current:
+            _LOGGER.warning("detection types: %s does not report %r",
+                            self.device_id, key)
+            return False
+        payload = dict(current)
+        payload[key] = 1 if enabled else 0
+        return await self.async_trigger_device_action(
+            "setRoiHuman", {"roi": [payload]})
+
     async def async_get_wifi_info(self) -> "Optional[dict]":
         """``{"ssid": str, "rssi": int}`` for the camera's own WiFi link.
 
