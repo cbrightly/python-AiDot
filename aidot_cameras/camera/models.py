@@ -247,6 +247,55 @@ class CameraDeviceInformation(DeviceInformation):
     # for a pan-only camera, [1,2,3,6] = full PTZ).  Empty means unknown - callers
     # should treat unknown as "show all" for backward compatibility.
     ptz_directions: list
+    # Every property identity this MODEL declares in its cloud profile - the
+    # same list the vendor app gates its settings pages on.  Distinct from the
+    # device's `properties` dict, which is what the cloud currently REPORTS and
+    # carries defaults for keys the model never implemented: an A000088 reports
+    # LingerDuration = "30" and, asked directly over LAN, has no such attribute
+    # and ignores writes to it.  Gate a control on this, not on a reported
+    # value, whenever offering it on the wrong model would mean a control that
+    # acknowledges and does nothing.
+    #
+    # Empty means the profile was absent or unreadable, which is UNKNOWN rather
+    # than "declares nothing" - so a caller that has other evidence a setting
+    # works (`Dimming` is real on the A000088 and verified by read-back there,
+    # though the profile omits it) should keep using that evidence instead.
+    declared_properties: frozenset
+
+    @staticmethod
+    def _collect_declared_properties(device: dict) -> frozenset:
+        """Property identities from the model profile, or empty if unreadable.
+
+        Keyed on ``identity``/``code``, never on ``name``: the profile's display
+        name is often a placeholder like
+        ``propertyName_lightBehavior_1679075889207132162``, and a name-keyed
+        search reported that no model declared a property every model declared.
+
+        The profile is remote data of no guaranteed shape, so every level is
+        type-checked rather than trusted; a malformed one yields an empty set
+        instead of killing device setup.
+        """
+        out = set()
+        try:
+            product = device.get(CONF_PRODUCT)
+            modules = product.get(CONF_SERVICE_MODULES) if isinstance(product, dict) else None
+            if not isinstance(modules, list):
+                return frozenset()
+            for service in modules:
+                if not isinstance(service, dict):
+                    continue
+                props = service.get(CONF_PROPERTIES)
+                if not isinstance(props, list):
+                    continue
+                for prop in props:
+                    if not isinstance(prop, dict):
+                        continue
+                    ident = prop.get("identity") or prop.get("code")
+                    if isinstance(ident, str) and ident:
+                        out.add(ident)
+        except Exception:
+            return frozenset()
+        return frozenset(out)
 
     def __init__(self, device: dict[str, Any]) -> None:
         super().__init__(device)
@@ -256,6 +305,7 @@ class CameraDeviceInformation(DeviceInformation):
             str(_aes) if _aes else "")
         self.device_password = device.get("password") or ""
         self.ptz_directions = []
+        self.declared_properties = self._collect_declared_properties(device)
         if CONF_PRODUCT in device and CONF_SERVICE_MODULES in device[CONF_PRODUCT]:
             for service in device[CONF_PRODUCT][CONF_SERVICE_MODULES]:
                 for prop in service.get(CONF_PROPERTIES) or []:

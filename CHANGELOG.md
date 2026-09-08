@@ -4,6 +4,34 @@ All notable changes to `python-aidot-cameras` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and this project uses
 date-less, incrementing versions published to PyPI via GitHub Releases.
 
+## [1.0.0rc17]
+
+### Added
+
+- **`CameraDeviceInformation.declared_properties`** -- every property identity
+  the MODEL declares in its cloud profile, which is the list the vendor app
+  gates its settings pages on.
+
+  This is not the same thing as the device's `properties` dict, and the
+  difference is what makes a control lie. Measured on an A000088 on
+  2026-09-08: the cloud reports `LingerDuration = "30"`, the camera asked
+  directly over LAN has no such attribute at all, and writing it is
+  acknowledged while nothing changes on the camera or in the cloud. `rc16`
+  shipped a control gated on the reported value, and on that model it could
+  never have worked.
+
+  Keyed on `identity`/`code`, never on `name`: the profile's display name is
+  often a placeholder like `propertyName_lightBehavior_<productId>`, and a
+  name-keyed search reports that no model declares a property every model
+  declares. An unreadable profile yields an empty set, which callers must read
+  as **unknown** rather than "declares nothing".
+
+### Fixed
+
+- Nothing in this library behaved wrongly; the gate that needed this data lives
+  in the integration. Recorded here because the distinction above is the part
+  worth not re-learning.
+
 ## [1.0.0rc16]
 
 ### Added
