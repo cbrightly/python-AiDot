@@ -200,8 +200,23 @@ as soak progress.
 
 #### The clock restarts 2026-09-06
 
-**Day zero is 2026-09-06. Two weeks from it is 2026-09-20.** It was set by
-`1.0.0rc11` and is unchanged by `1.0.0rc12`, which was cut the same day.
+**Day zero is 2026-09-07. Two weeks from it is 2026-09-21.**
+
+By the RELEASE rule alone it would still be 2026-09-06: `rc11` set it, and
+`rc12`, `rc13` and `rc14` are each classified below as not streaming-breaking,
+so none of them resets the clock.
+
+It moves anyway, for the other reason this document already gives: **2026-09-07
+was not ordinary use.** Two releases went out, Home Assistant was restarted
+four times, the config entry was disabled and re-enabled repeatedly to run
+read-only probes and a drained-fleet screen against real cameras, the mains
+warm-hold was changed from 0 to 120 s, and a dozen opens were forced by hand.
+That is "nothing broke while being provoked", which the bar explicitly does not
+accept as soak evidence.
+
+The clock therefore runs from the box settling on `1.0.0rc14` + integration
+`2.21.1` on the evening of 2026-09-07. Everything before that is provocation,
+not soak.
 
 The rc9 window is void, and for the reason that made checking the box part of
 dating day zero in the first place. On 2026-09-05 the box was hot-patched with
