@@ -11,12 +11,11 @@ that sit UNDER it in the app were missing:
 Read from the cloud device profile 2026-09-07 (LK.IPC.A001513, the L2), and
 every one of the three is carried as a live property value by the L2 and by the
 A000088 alike. Of the three, `LingerDuration` and `Dimming` were confirmed on
-hardware to land (written, read back changed, restored); `lightBehavior` acks
-and does NOT land on either model, so the library keeps the setter and Home
-Assistant deliberately ships no control for it. The vendor app CAN set it
-(confirmed 2026-09-08), so this is our request being wrong rather than the
-camera lacking the feature -- see `async_set_light_behavior` for what has been
-refuted. The A001064 has neither `lightBehavior` nor `LingerDuration` in
+hardware to land (written, read back changed, restored); `lightBehavior` appeared not to land at all
+until 2026-09-08, when the cause turned out to be a battery camera never given
+time to wake before the command arrived (fixed in `1.0.0rc18`). It lands now,
+and Home Assistant ships a control for it gated on the model profile - only the
+A001513 declares it. The A001064 has neither `lightBehavior` nor `LingerDuration` in
 its profile or its properties, so those controls must stay absent there rather
 than appear reading "unknown" -- which is why every getter here answers None
 for a camera that never reported the key.

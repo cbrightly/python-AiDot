@@ -86,33 +86,18 @@ class _CameraControlsMixin:
     async def async_set_light_behavior(self, behavior: str) -> bool:
         """Set how the light behaves when it triggers: "constant" or "flash".
 
-        **This write acks and does not land, and the reason is still open.**
-        The vendor app CAN set it: on 2026-09-08 the owner changed Behavior in
-        the app on an A001513 and the cloud property moved 0 -> 1, so the
-        camera implements the setting and something about our request is wrong.
+        This looked for a while like an attribute the camera would not accept:
+        the write acked and the value never moved, across both models, as int
+        and as string, armed and disarmed. It was none of those. A battery
+        camera was never given time to wake before the command arrived behind
+        its own wake, and every one of those attempts went to a sleeping
+        camera. Fixed in ``1.0.0rc18``; the write now lands on a sleeping
+        camera, verified by read-back.
 
-        Refuted, each by measurement, so nobody re-runs them:
-
-        - it is not int-vs-string, and not model-specific (A001513 and A000088)
-        - it is not the automation being disarmed: retried with
-          ``autoLightEnable`` at 1 and it still did not move
-        - it is not the missing ``parentId`` the app sends in its payload;
-          adding it changed nothing
-        - it is not ``lightMode`` needing to be 7 first -- that attribute does
-          not land either
-
-        Also untrue of the HTTP path: ``POST {api}/watch/setDeviceAttr``, the
-        app's fourth transport, answers 200 with an empty body and moves
-        nothing -- but it fails identically for ``Dimming``, which certainly
-        works over MQTT, so **that call is broken and proves nothing**. Any
-        future attempt down that road must calibrate on a known-good attribute
-        first.
-
-        The method is kept because the command is well-formed, but **nothing
-        should build a control on it** until a read-back confirms one: a
-        setting that reports a value the camera never applied is worse than no
-        setting. Same call as ``async_set_resolution``. The decisive evidence
-        nobody has yet is what the app actually puts on the wire.
+        Only the A001513 declares ``lightBehavior`` in its model profile. An
+        A000088 carries a value for it in the cloud's property list and, asked
+        directly over LAN, has no such attribute at all - so a control must be
+        gated on the profile, not on a reported value.
 
         Refuses a name the camera does not offer rather than sending it: the
         attribute is an enum, and an out-of-range write is accepted silently.
