@@ -6561,11 +6561,20 @@ class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesO
         # A001064 on the first attempt. Reverting THIS LINE ALONE, with every
         # other change of that release left in place, restored 3 of 3.
         #
-        # The A000088 is a different SoC (Realtek Ameba, FreeRTOS/KM4) whose
-        # image has never been disassembled. A finding from the A001064's
-        # firmware does not transfer to it, and this camera does not merely
-        # ignore the byte - announcing APP_ANDROID makes it accept the session
-        # and send nothing, which is worse than the random value it replaced.
+        # The A000088 is a different SoC (Realtek RTL8735B / AmebaPro2). Its
+        # image WAS disassembled on 2026-09-07, and it has **no client class at
+        # all**: `lds_process_peerid` in rtc_mqtt.c parses
+        # `%[^_]_%[^_]_%02hhd_%02hhd_%02hhd`, keeps field 2 as an opaque string
+        # at buf+0x32, and never derives a class from its first character. It
+        # also treats a parse failure as NON-fatal - it substitutes the literal
+        # "userid" for field 2 and continues. Only field 1 is compared, against
+        # "google". So `client_type = field2[0]-'0'` and "a malformed peer id is
+        # rejected outright" are BOTH A001064-only; do not generalise either.
+        #
+        # Which leaves the class-0 result real but unexplained: 0 of 9 is not
+        # luck against a 29-of-30 baseline, yet the firmware has nothing there
+        # to read. Do not repeat "class 0 breaks it because it announces
+        # APP_ANDROID" - that story is not supported by the image.
         #
         # Class '2' (WEB) - what the vendor web app sends - was screened on
         # 2026-09-07 and does NOT break it: 6 of 6 A000088 cameras PASS across
