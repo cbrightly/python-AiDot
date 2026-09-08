@@ -15,6 +15,24 @@ from .constants import _PTZ_DIR_CODES, _STREAM_QUALITY, SETSTREAMCTRL_CMD
 
 _LOGGER = logging.getLogger(__name__)
 
+#: How the floodlight behaves when the camera sees someone, by the name the
+#: vendor app prints against each value. From the cloud device profile
+#: (LK.IPC.A001513): ``lightBehavior`` is an enum with allowedValues
+#: ``Constant=0, Flash=1``, default 0.
+LIGHT_BEHAVIORS = {"constant": 0, "flash": 1}
+
+#: How long the floodlight stays on after it triggers, in seconds. The camera
+#: enumerates exactly these four (``LingerDuration``, default 30) -- it is not a
+#: free range, and a value outside the set is accepted on the wire and ignored,
+#: which would leave a control reporting a setting the camera never applied.
+LIGHT_LINGER_DURATIONS = (20, 30, 40, 50)
+
+#: The floodlight level the camera accepts (``Dimming``: min 10, max 100).
+#: The floor is 10, not 0: 0 is out of range rather than "off", and off is
+#: LightOnOff.
+LIGHT_BRIGHTNESS_MIN = 10
+LIGHT_BRIGHTNESS_MAX = 100
+
 #: The camera's ack for SETSTREAMCTRL (800).
 SETSTREAMCTRL_RESP_CMD = 801
 #: Measured 0.01-0.03s; short so a control call never holds up a view.
@@ -56,9 +74,64 @@ class _CameraControlsMixin:
         return await self.async_set_device_attribute("OSDEnable", 1 if enabled else 0)
 
     async def async_set_auto_light(self, enabled: bool) -> bool:
-        """Enable or disable floodlight automation (autoLightEnable)."""
+        """Turn the light-up-when-someone-appears automation on or off.
+
+        This is ``autoLightEnable``, which the vendor app labels "When Someone
+        Appears" (or "When Someone Appears at Night" on some models -- that is
+        which label the app prints for the model, not a separate setting).
+        """
         return await self.async_set_device_attribute(
             "autoLightEnable", 1 if enabled else 0)
+
+    async def async_set_light_behavior(self, behavior: str) -> bool:
+        """Set how the light behaves when it triggers: "constant" or "flash".
+
+        **This write acks and does not land.** Measured 2026-09-07 against an
+        A001513 (which declares ``lightBehavior`` in its profile) and an
+        A000088 (which does not): six attempts across both models, as int 1 and
+        as string "1", every one returning True and every read-back over the
+        following 20 s still reporting the old value. On the same camera in the
+        same session ``LingerDuration`` and ``Dimming`` both landed within 4 s,
+        so this is the attribute, not the camera being asleep or the cloud
+        lagging. The one hypothesis left untested is that the camera takes it
+        only while ``autoLightEnable`` is 1 -- untested because arming it makes
+        a real floodlight come on in someone's house.
+
+        The method is kept because the command is well-formed and a future
+        firmware may honour it, but **nothing should build a control on it**
+        until a read-back confirms one: a setting that reports a value the
+        camera never applied is worse than no setting. Same call as
+        ``async_set_resolution``.
+
+        Refuses a name the camera does not offer rather than sending it: the
+        attribute is an enum, and an out-of-range write is accepted silently.
+        """
+        try:
+            value = LIGHT_BEHAVIORS[behavior]
+        except KeyError:
+            raise ValueError(
+                f"unknown light behavior {behavior!r}; "
+                f"expected one of {sorted(LIGHT_BEHAVIORS)}") from None
+        return await self.async_set_device_attribute("lightBehavior", value)
+
+    async def async_set_light_linger_duration(self, seconds: int) -> bool:
+        """Set how long the light stays on after it triggers, in seconds."""
+        if seconds not in LIGHT_LINGER_DURATIONS:
+            raise ValueError(
+                f"unsupported linger duration {seconds!r}; "
+                f"the camera offers {list(LIGHT_LINGER_DURATIONS)}")
+        return await self.async_set_device_attribute("LingerDuration", seconds)
+
+    async def async_set_light_brightness(self, level: int) -> bool:
+        """Set the floodlight level (10-100), clamped to what the camera takes.
+
+        Separate from :meth:`async_set_floodlight`'s optional brightness, which
+        is part of turning the light on by hand; this is the level the camera
+        uses when its own automation fires.
+        """
+        return await self.async_set_device_attribute(
+            "Dimming",
+            max(LIGHT_BRIGHTNESS_MIN, min(LIGHT_BRIGHTNESS_MAX, int(level))))
 
     async def async_set_voice_prompts(self, enabled: bool) -> bool:
         """Enable or disable spoken prompts from the camera speaker (voiceEnable)."""

@@ -4,6 +4,53 @@ All notable changes to `python-aidot-cameras` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and this project uses
 date-less, incrementing versions published to PyPI via GitHub Releases.
 
+## [1.0.0rc16]
+
+### Added
+
+- **The settings that sit under "light up when someone appears" are now
+  readable and settable.** The master toggle -- what the vendor app labels
+  "When Someone Appears" -- has always been `autoLightEnable`, and this library
+  already exposed it. What was missing were the settings beneath it, read from
+  the cloud device profile for `LK.IPC.A001513` (the L2):
+
+  | attribute | offered by the camera |
+  |---|---|
+  | `LingerDuration` | 20 / 30 / 40 / 50 seconds, default 30 |
+  | `Dimming` | 10-100, default 100 |
+  | `lightBehavior` | Constant=0, Flash=1, default 0 |
+
+  `async_set_light_linger_duration(seconds)` and
+  `async_set_light_brightness(level)` cover the first two, and the values land
+  on real hardware -- written, read back changed, and restored, on an A001513
+  and an A000088. Both refuse a value the camera does not offer instead of
+  sending it: the duration is an enum of exactly four, and an out-of-range
+  write is accepted on the wire and ignored, which is how a control comes to
+  report a setting the camera never applied. The brightness floor is **10, not
+  0** -- 0 is out of range rather than "off".
+
+  Status gains `light_linger_duration`, `light_brightness` and
+  `light_behavior`, each `None` until the camera reports it. An A001064 reports
+  neither duration nor behaviour at all, so those stay unknown there rather
+  than reading as a default.
+
+  `light_brightness` is read from `Dimming` **without** letting `Dimming` reach
+  the light-platform brightness field, which is why that key is filtered in the
+  first place. Both facts now have a test.
+
+### Known not to work
+
+- **`async_set_light_behavior` acks and does not land**, and nothing should
+  build a control on it yet. Six attempts across an A001513 and an A000088, as
+  int and as string, every one returning True and every read-back over the next
+  20 s still reporting the old value -- while `LingerDuration` and `Dimming`
+  landed within 4 s on the same camera in the same session. So it is the
+  attribute, not a sleeping camera or a lagging cloud. The untested hypothesis
+  is that the camera takes it only while the automation is armed, which is
+  untested because arming it makes a real floodlight come on in someone's
+  house. The method is kept, documented, and deliberately not wired to
+  anything -- the same call made for `async_set_resolution`.
+
 ## [1.0.0rc15]
 
 ### Added

@@ -97,8 +97,18 @@ class CameraStatusData(DeviceStatusData):
     status_led: Optional[bool] = None
     #: Timestamp/OSD overlay burned into the video (OSDEnable).
     osd_timestamp: Optional[bool] = None
-    #: Floodlight automation (autoLightEnable).
+    #: Floodlight automation (autoLightEnable). The vendor app labels this
+    #: "When Someone Appears" -- it is the person-triggered light, not a
+    #: generic schedule, and the three fields below are its settings.
     auto_light: Optional[bool] = None
+    #: How the light behaves when it triggers: "constant" or "flash"
+    #: (lightBehavior 0/1). An unmodelled number is carried through as itself.
+    light_behavior: Optional[str] = None
+    #: How long the light stays on after a trigger, in seconds (LingerDuration).
+    light_linger_duration: Optional[int] = None
+    #: Floodlight level 10-100 (Dimming). Kept apart from `dimming`, which is
+    #: the light platform's brightness -- see _LIGHT_ONLY_ATTR_KEYS.
+    light_brightness: Optional[int] = None
     #: Spoken prompts from the camera speaker (voiceEnable).
     voice_prompts: Optional[bool] = None
     #: HDR (HDRStatus).
@@ -153,6 +163,16 @@ class CameraStatusData(DeviceStatusData):
             self.osd_timestamp = b
         if (b := _as_bool(attr.get("autoLightEnable"))) is not None:
             self.auto_light = b
+        if (v := attr.get("lightBehavior")) is not None:
+            lb = _as_int(v)
+            # Same shape as nightVisionMode: name the values we know and carry
+            # anything else through, so a firmware that grows a third mode
+            # cannot be reported as one of the two we do know.
+            self.light_behavior = (
+                {0: "constant", 1: "flash"}.get(lb, str(lb))
+                if lb is not None else str(v))
+        if (i := _as_int(attr.get("LingerDuration"))) is not None:
+            self.light_linger_duration = i
         if (b := _as_bool(attr.get("voiceEnable"))) is not None:
             self.voice_prompts = b
         if (b := _as_bool(attr.get("HDRStatus"))) is not None:
@@ -201,6 +221,13 @@ class CameraStatusData(DeviceStatusData):
         ``properties`` dict - both share the same camera attribute keys
         (Battery_remaining, Occupancy, SDcardStatus, MotionDetection_*, ...).
         """
+        # Dimming is filtered out below because on a LIGHT it is the entity's
+        # brightness, and a camera's must never be read as one. On a camera it
+        # is nonetheless a real setting -- the floodlight's level, 10-100 in the
+        # device profile, and what the app's Brightness page writes -- so read
+        # it here into its own field rather than letting the filter lose it.
+        if (i := _as_int(attrs.get(CONF_DIMMING))) is not None:
+            self.light_brightness = i
         self.update({
             k: v for k, v in attrs.items()
             if k not in self._LIGHT_ONLY_ATTR_KEYS
