@@ -190,6 +190,49 @@ class _CameraControlsMixin:
         return await self.async_trigger_device_action(
             "setRoiHuman", {"roi": [payload]})
 
+    #: The siren's automatic trigger.  ``autoAlarm`` is the master; the other
+    #: two say what sets it off.  Probed 2026-09-07: NOT a mirror of anything
+    #: else we expose -- on an A000088 ``motionDetection`` read 0 while the
+    #: camera's own motion-detection setting read True, and on an A001064
+    #: ``humanDetect`` read 0 while ``getRoiHuman``'s read 1.
+    AUTO_ALARM_KEYS = ("autoAlarm", "motionDetection", "humanDetect")
+
+    async def async_get_auto_alarm(self) -> "Optional[dict]":
+        """Siren auto-trigger settings as ``{key: bool}``.
+
+        ``None`` means the camera did not answer -- unknown, NOT all-off.
+        Reporting an unanswered camera as three disarmed switches would claim a
+        state it never gave, and this is the setting that decides whether a
+        siren goes off in someone's house.
+        """
+        out = await self.async_query_device_action("getAutoAlarm")
+        if not isinstance(out, list) or not out or not isinstance(out[0], dict):
+            return None
+        return {k: bool(v) for k, v in out[0].items()}
+
+    async def async_set_auto_alarm(self, key: str, enabled: bool) -> bool:
+        """Arm or disarm the siren's automatic trigger, or one of its causes.
+
+        Read-modify-write against the camera's own object.  That matters more
+        here than anywhere else: rebuilding the payload from our own key list
+        could arm ``autoAlarm`` as a side effect of changing a trigger, which
+        would make a camera start sounding a siren nobody asked it to.
+        """
+        out = await self.async_query_device_action("getAutoAlarm")
+        if not isinstance(out, list) or not out or not isinstance(out[0], dict):
+            _LOGGER.warning(
+                "auto alarm: %s did not report its settings; not writing",
+                self.device_id)
+            return False
+        current = out[0]
+        if key not in current:
+            _LOGGER.warning("auto alarm: %s does not report %r",
+                            self.device_id, key)
+            return False
+        payload = dict(current)
+        payload[key] = 1 if enabled else 0
+        return await self.async_trigger_device_action("setAutoAlarm", [payload])
+
     async def async_get_wifi_info(self) -> "Optional[dict]":
         """``{"ssid": str, "rssi": int}`` for the camera's own WiFi link.
 
