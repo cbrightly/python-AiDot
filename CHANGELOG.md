@@ -4,6 +4,32 @@ All notable changes to `python-aidot-cameras` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and this project uses
 date-less, incrementing versions published to PyPI via GitHub Releases.
 
+## [1.0.0rc15]
+
+### Added
+
+- **The camera's automatic siren can now be read and set.**
+  `async_get_auto_alarm()` returns `{autoAlarm, motionDetection, humanDetect}` --
+  a master switch and the two events that fire it -- and
+  `async_set_auto_alarm(key, enabled)` changes one of them.
+
+  This is not a duplicate of anything already exposed, which was checked rather
+  than assumed. On an A000088 its `motionDetection` read `0` while the camera's
+  own motion-detection setting read `True`; on an A001064 its `humanDetect` read
+  `0` while `getRoiHuman`'s read `1`. Two independent settings that share field
+  names.
+
+  The setter is read-modify-write against the camera's own object, which matters
+  more here than anywhere else in this library: rebuilding the payload from our
+  own key list could arm `autoAlarm` as a side effect of changing a trigger, and
+  make a camera sound a siren nobody asked it to. Verified on both mains models
+  with the master left at `0` throughout and asserted still `0` after each
+  write -- the triggers are inert while it is disarmed, so nothing sounded.
+
+  A camera that does not answer reads as **unknown**, never all-off. That is the
+  worst of the three states to guess at here: a confident "off" would read as
+  "the siren will not sound" without the camera having said so.
+
 ## [1.0.0rc14]
 
 ### Changed
