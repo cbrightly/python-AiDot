@@ -8,7 +8,7 @@ import random
 import time
 import asyncio
 import warnings
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional, Union
 
 if TYPE_CHECKING:  # annotation only; keeps av off the import path
     from av import VideoFrame as AvVideoFrame
@@ -1268,6 +1268,43 @@ def _expt_peer_id_fields(device_id=None, path=None):
     return (terminal, out[0], out[1], out[2])
 
 
+#: How long to leave between waking a battery camera and sending the command.
+#: Measured 2026-09-08 on an A001513: a wake followed by a 5 s gap landed a
+#: `lightBehavior` write that had failed for hours when both went out together.
+#: This is the shortest gap that was shown to work, so do not shorten it
+#: without a fresh measurement.
+WAKE_SETTLE_S = 5.0
+
+#: How long one wake is assumed to keep the camera up. Home Assistant writes
+#: attributes in bursts, and waking once per attribute would cost a battery
+#: camera dearly. Deliberately well under the ~80 s after which a write was
+#: observed to stop landing, so a burst's tail does not arrive at a camera we
+#: only think is still awake.
+WAKE_WARM_S = 30.0
+
+
+class _WakePlan(NamedTuple):
+    """Whether to wake before a command, and how long to wait after."""
+
+    wake: bool
+    settle: float
+
+
+def _wake_plan(*, is_battery: bool, now: float,
+               last_wake: "Optional[float]") -> _WakePlan:
+    """Decide the wake for one command. Pure, so the decision is testable.
+
+    A mains camera is always up and is never woken. A battery camera is woken
+    unless one is still in flight from moments ago -- and a clock that has gone
+    backwards wakes rather than silently disabling the wake for good.
+    """
+    if not is_battery:
+        return _WakePlan(False, 0.0)
+    if last_wake is not None and 0 <= (now - last_wake) < WAKE_WARM_S:
+        return _WakePlan(False, 0.0)
+    return _WakePlan(True, WAKE_SETTLE_S)
+
+
 class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesOpenMixin):
     """All camera/streaming methods, mixed into DeviceClient via inheritance."""
 
@@ -2446,7 +2483,18 @@ class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesO
         # Battery cameras (batteryMode=2) sleep between sessions and disconnect
         # from MQTT.  Without the wake call they miss our setDevAttrReq.
         # Payload from DeviceWakeUpRepos.java - no srcAddr/seq/tst.
+        #
+        # The wake goes out as its OWN publish, and the command only follows
+        # after a gap.  Both used to leave in a single batch, back to back,
+        # which a deeply asleep camera cannot act on in time: it is still
+        # waking when the command arrives behind the wake, so the command is
+        # dropped while the broker's own response still scans as an ack.
+        # Measured 2026-09-08 on an A001513 - `lightBehavior` writes failed for
+        # hours, and a wake plus a 5 s gap landed one first try.  `Dimming` and
+        # `LingerDuration` hid this for months because the cloud shadows them
+        # and they land on a sleeping camera anyway.
         publish_items: list = []
+        _wake_items: list = []
         if self.is_battery_camera:
             _wake_payload = _json.dumps({
                 "method":  "lowPowerActiveStateReq",
@@ -2456,13 +2504,46 @@ class CameraMixin(_CameraControlsMixin, _CameraSdMixin, _WebRTCOpenMixin, _SdesO
                 "payload": {"devId": device_id, "status": "wakeup"},
             })
             _wake_topic = f"iot/v1/s/{user_id}/IPCAM/lowPowerActiveStateReq"
+            # Still carried with the command too: it is what reaches a camera
+            # that has kept its MQTT session, and it costs one small publish.
             publish_items.append((_wake_topic, _wake_payload))
+            _wake_items.append((_wake_topic, _wake_payload))
         publish_items.append((pub_topic, payload_str))
 
         if self._resolve_persistent_mqtt():
             pm = await self._get_persistent_mqtt()
         else:
             pm = None
+
+        import time as _time
+
+        _plan = _wake_plan(
+            is_battery=bool(self.is_battery_camera),
+            now=_time.monotonic(),
+            last_wake=getattr(self, "_last_wake_mono", None),
+        )
+        if _plan.wake and _wake_items:
+            try:
+                if pm is not None:
+                    await pm.request(publish_items=_wake_items,
+                                     subscribe_topics=[], timeout=2.0)
+                else:
+                    # The SAME registered client id, never a variant: a second
+                    # id on this account evicts the live session
+                    # (project_aidot_mqtt_query_traps). Safe because the wake
+                    # session is awaited to completion before the command
+                    # session opens - they never overlap.
+                    await _mqtt_session_with_status(
+                        mqtt_url, mqtt_user, mqtt_pwd, client_id,
+                        subscribe_topics=[], publish_items=_wake_items,
+                        duration=2.0)
+                self._last_wake_mono = _time.monotonic()
+            except Exception:
+                # A failed wake must not stop the command: on a camera that is
+                # already up the command works without it.
+                _LOGGER.debug("camera %s: wake publish failed", device_id,
+                              exc_info=True)
+            await asyncio.sleep(_plan.settle)
         if pm is not None:
             messages, _st = await pm.request(
                 publish_items=publish_items,

@@ -4,6 +4,45 @@ All notable changes to `python-aidot-cameras` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and this project uses
 date-less, incrementing versions published to PyPI via GitHub Releases.
 
+## [1.0.0rc18]
+
+### Fixed
+
+- **A battery camera never got time to wake before the command arrived, so
+  control commands were silently dropped.** `_mqtt_device_cmd` published the
+  low-power wake and the command in a single batch, back to back. A deeply
+  asleep camera is still coming up when the `setDevAttrReq` lands behind the
+  wake, so it drops the command -- while the broker's own response still scans
+  as an ack. Every attempt returned success and changed nothing.
+
+  The wake now goes out as its own publish and the command follows after a
+  settle.
+
+  | | |
+  |---|---|
+  | settle | **5 s**, the shortest gap measured to work |
+  | warm window | **30 s**, so a burst of writes wakes once, not once per attribute |
+  | mains cameras | never woken, never delayed |
+
+  Proven on an A001513 on 2026-09-08. Writes to `lightBehavior` had failed for
+  hours; opening a keepalive session woke the camera in 13 s and the identical
+  write landed first try; a bare wake plus a 5 s gap landed it with no session.
+  The fixed library then landed two writes on a genuinely sleeping camera, the
+  second after the warm window had lapsed so it rode its own wake.
+
+  The warm window is deliberately well under the ~80 s after which a write was
+  observed to stop landing, so a burst's tail cannot arrive at a camera we only
+  think is still awake. A clock that goes backwards wakes rather than disabling
+  the wake for good, and a failed wake never blocks the command.
+
+  **`async_wake_camera()` is not a substitute**: its HTTP 200 means the cloud
+  accepted the wake, not that the camera came up, and a write 20 s later still
+  did not land.
+
+  Why this hid: `Dimming` and `LingerDuration` are cloud-shadowed and land on a
+  sleeping camera anyway, so one sleeping camera would accept two settings and
+  drop a third -- which reads as an attribute problem rather than a timing one.
+
 ## [1.0.0rc17]
 
 ### Added
