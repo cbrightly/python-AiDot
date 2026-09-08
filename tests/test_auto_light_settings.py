@@ -13,8 +13,10 @@ every one of the three is carried as a live property value by the L2 and by the
 A000088 alike. Of the three, `LingerDuration` and `Dimming` were confirmed on
 hardware to land (written, read back changed, restored); `lightBehavior` acks
 and does NOT land on either model, so the library keeps the setter and Home
-Assistant deliberately ships no control for it -- see
-`async_set_light_behavior`. The A001064 has neither `lightBehavior` nor `LingerDuration` in
+Assistant deliberately ships no control for it. The vendor app CAN set it
+(confirmed 2026-09-08), so this is our request being wrong rather than the
+camera lacking the feature -- see `async_set_light_behavior` for what has been
+refuted. The A001064 has neither `lightBehavior` nor `LingerDuration` in
 its profile or its properties, so those controls must stay absent there rather
 than appear reading "unknown" -- which is why every getter here answers None
 for a camera that never reported the key.

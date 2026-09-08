@@ -86,22 +86,33 @@ class _CameraControlsMixin:
     async def async_set_light_behavior(self, behavior: str) -> bool:
         """Set how the light behaves when it triggers: "constant" or "flash".
 
-        **This write acks and does not land.** Measured 2026-09-07 against an
-        A001513 (which declares ``lightBehavior`` in its profile) and an
-        A000088 (which does not): six attempts across both models, as int 1 and
-        as string "1", every one returning True and every read-back over the
-        following 20 s still reporting the old value. On the same camera in the
-        same session ``LingerDuration`` and ``Dimming`` both landed within 4 s,
-        so this is the attribute, not the camera being asleep or the cloud
-        lagging. The one hypothesis left untested is that the camera takes it
-        only while ``autoLightEnable`` is 1 -- untested because arming it makes
-        a real floodlight come on in someone's house.
+        **This write acks and does not land, and the reason is still open.**
+        The vendor app CAN set it: on 2026-09-08 the owner changed Behavior in
+        the app on an A001513 and the cloud property moved 0 -> 1, so the
+        camera implements the setting and something about our request is wrong.
 
-        The method is kept because the command is well-formed and a future
-        firmware may honour it, but **nothing should build a control on it**
-        until a read-back confirms one: a setting that reports a value the
-        camera never applied is worse than no setting. Same call as
-        ``async_set_resolution``.
+        Refuted, each by measurement, so nobody re-runs them:
+
+        - it is not int-vs-string, and not model-specific (A001513 and A000088)
+        - it is not the automation being disarmed: retried with
+          ``autoLightEnable`` at 1 and it still did not move
+        - it is not the missing ``parentId`` the app sends in its payload;
+          adding it changed nothing
+        - it is not ``lightMode`` needing to be 7 first -- that attribute does
+          not land either
+
+        Also untrue of the HTTP path: ``POST {api}/watch/setDeviceAttr``, the
+        app's fourth transport, answers 200 with an empty body and moves
+        nothing -- but it fails identically for ``Dimming``, which certainly
+        works over MQTT, so **that call is broken and proves nothing**. Any
+        future attempt down that road must calibrate on a known-good attribute
+        first.
+
+        The method is kept because the command is well-formed, but **nothing
+        should build a control on it** until a read-back confirms one: a
+        setting that reports a value the camera never applied is worse than no
+        setting. Same call as ``async_set_resolution``. The decisive evidence
+        nobody has yet is what the app actually puts on the wire.
 
         Refuses a name the camera does not offer rather than sending it: the
         attribute is an enum, and an out-of-range write is accepted silently.
