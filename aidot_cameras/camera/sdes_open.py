@@ -639,6 +639,17 @@ def _video_repeat_too_late(bridge_fn, seq: int, now: float,
 
     Shares the NACK tracker deliberately: a second one would not know which
     packets had ever been missing, so nothing would ever look late.
+
+    **Measured 2026-09-12: this guard drops NOTHING in practice.** Over a
+    22-hour window on the box, ffmpeg reported 1612 backward DTS jumps (p50
+    0.48 s, p90 1.73 s, max 2.60 s) and `_nack_late_drops` stayed at zero. The
+    obvious explanations were checked and both are wrong: at the measured
+    47 packets/s, `max_behind=200` is a 4.3 s prune horizon and `max_gap=250`
+    needs 5.3 s of loss to reset, so every one of those jumps falls inside the
+    band this guard can see. The late packets are therefore **not
+    retransmissions the tracker ever asked for**, and what they actually are is
+    still unknown - see project_aidot_dts_bursts_are_the_serve_seam. Do not
+    assume this guard covers the DTS bursts; it does not.
     """
     tracker = getattr(bridge_fn, "_nack_tracker", None)
     if tracker is None:
